@@ -1,0 +1,18 @@
+# Put this next to LibreChat's docker-compose.yml as docker-compose.override.yml
+# (or merge into your existing override). The folder openrouter-media-mcp/ must sit
+# in the same directory as LibreChat's docker-compose.yml.
+services:
+  openrouter-media:
+    build: ./openrouter-media-mcp
+    container_name: openrouter-media
+    restart: unless-stopped
+    env_file: ./openrouter-media-mcp/.env
+    volumes:
+      # named volume: keeps the container's non-root user able to write
+      - openrouter-media-data:/data
+    ports:
+      # only reachable from the VPS itself (nginx); never expose 3400 publicly
+      - "127.0.0.1:3400:3400"
+
+volumes:
+  openrouter-media-data:

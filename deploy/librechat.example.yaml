@@ -1,0 +1,35 @@
+# Add these parts to your existing librechat.yaml (do not replace the whole file).
+
+# 1) Let LibreChat reach the MCP container on the internal Docker network.
+#    LibreChat blocks private addresses by default (SSRF protection);
+#    this exempts only this one host:port.
+mcpSettings:
+  allowedAddresses:
+    - 'openrouter-media:3400'
+
+# 2) The MCP server itself.
+mcpServers:
+  openrouter-media:
+    type: streamable-http
+    url: http://openrouter-media:3400/mcp
+    headers:
+      X-API-Key: '${OPENROUTER_MEDIA_SECRET}'   # put OPENROUTER_MEDIA_SECRET=<same as MCP_SHARED_SECRET> in LibreChat's .env
+      X-User-ID: '{{LIBRECHAT_USER_ID}}'        # per-user daily limits
+    timeout: 300000        # video generation can take a few minutes (default is 60000)
+    initTimeout: 30000
+    chatMenu: false        # only usable through the agents you build, not the chat composer
+    serverInstructions: false
+
+# 3) IMPORTANT: keep your OpenRouter endpoint's `name` as "OpenRouter".
+#    LibreChat only sends images to the model compactly for known providers
+#    (openrouter, openai, anthropic, google, ...). With another name, every
+#    generated image would be pasted into the model context as base64 text.
+#    For white-labeling, change what users see with modelDisplayLabel instead:
+#
+# endpoints:
+#   custom:
+#     - name: "OpenRouter"
+#       modelDisplayLabel: "Velorafy"
+#       apiKey: "${OPENROUTER_KEY}"
+#       baseURL: "https://openrouter.ai/api/v1"
+#       ...
