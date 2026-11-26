@@ -64,12 +64,15 @@ docker run -d --name "$NAME" --network "$NET" \
   -v openrouter-media-data:/data \
   --restart unless-stopped \
   "$NAME" >/dev/null
+# note: capture logs first; `docker logs | grep -q` fails under pipefail (SIGPIPE)
+STARTED=no
 for i in $(seq 1 20); do
-  docker logs "$NAME" 2>&1 | grep -q "listening" && break
+  LOGS="$(docker logs "$NAME" 2>&1 || true)"
+  if [[ "$LOGS" == *"listening on"* ]]; then STARTED=yes; break; fi
   sleep 1
 done
-docker logs "$NAME" 2>&1 | tail -5
-if ! docker logs "$NAME" 2>&1 | grep -q "listening"; then red "MCP server başlamadı (yuxarıdakı loqa bax)"; exit 1; fi
+printf '%s\n' "$LOGS" | tail -5
+if [ "$STARTED" != yes ]; then red "MCP server başlamadı (yuxarıdakı loqa bax)"; exit 1; fi
 green "OK"
 
 # ---------- 2. librechat.yaml ----------
@@ -182,16 +185,18 @@ green "OK"
 step "5/5 LibreChat-API yenidən başladılır"
 docker restart "$API_CONTAINER" >/dev/null
 echo "LibreChat-ın açılması gözlənilir (60 saniyəyə qədər)..."
+API_LOGS=""
 for i in $(seq 1 30); do
-  docker logs --since 3m "$API_CONTAINER" 2>&1 | grep -qi "openrouter-media" && break
+  API_LOGS="$(docker logs --since 3m "$API_CONTAINER" 2>&1 || true)"
+  if [[ "${API_LOGS,,}" == *"openrouter-media"* ]]; then break; fi
   sleep 2
 done
 echo "--- LibreChat loqunda openrouter-media:"
-docker logs --since 3m "$API_CONTAINER" 2>&1 | grep -i "openrouter-media" | tail -6 || true
+printf '%s\n' "$API_LOGS" | grep -i "openrouter-media" | tail -6 || true
 
 echo "--- Public media yolu:"
 BODY="$(curl -s -m 15 "$PUBLIC/media/install-check" || true)"
-if echo "$BODY" | grep -q "Cannot GET /media/install-check"; then
+if [[ "$BODY" == *"Cannot GET /media/install-check"* ]]; then
   green "OK — $PUBLIC/media/ MCP serverə çatır"
 else
   red "Gözlənilən cavab gəlmədi: $(echo "$BODY" | head -c 200)"
