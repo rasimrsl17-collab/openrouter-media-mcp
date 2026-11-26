@@ -89,6 +89,9 @@ server_block = [
     "    url: http://openrouter-media:3400/mcp",
     "    headers:",
     f'      X-API-Key: "{secret}"',
+    # chat-only header: LibreChat omits requestHeaders during startup tool discovery,
+    # so a user placeholder here does not block tool listing (see data-provider mcp.ts)
+    "    requestHeaders:",
     '      X-User-ID: "{{LIBRECHAT_USER_ID}}"',
     "    timeout: 300000",
     "    initTimeout: 30000",
@@ -97,7 +100,14 @@ server_block = [
 ]
 
 if re.search(r"^  openrouter-media:\s*$", text, re.M):
-    print("mcpServers.openrouter-media artıq var — keçildi")
+    # migrate v1 config: X-User-ID under `headers` blocks startup tool discovery
+    old = '\n      X-User-ID: "{{LIBRECHAT_USER_ID}}"'
+    if old in text and "\n    requestHeaders:" + old not in text:
+        text = text.replace(old, "\n    requestHeaders:" + old, 1)
+        lines = text.split("\n")
+        print("openrouter-media: X-User-ID requestHeaders-ə köçürüldü")
+    else:
+        print("mcpServers.openrouter-media artıq var — keçildi")
 else:
     idx = [i for i, l in enumerate(lines) if re.match(r"^mcpServers:\s*(#.*)?$", l)]
     if len(idx) == 1:
