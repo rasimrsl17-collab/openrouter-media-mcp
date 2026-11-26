@@ -20,16 +20,5 @@ mcpServers:
     chatMenu: false        # only usable through the agents you build, not the chat composer
     serverInstructions: false
 
-# 3) IMPORTANT: keep your OpenRouter endpoint's `name` as "OpenRouter".
-#    LibreChat only sends images to the model compactly for known providers
-#    (openrouter, openai, anthropic, google, ...). With another name, every
-#    generated image would be pasted into the model context as base64 text.
-#    For white-labeling, change what users see with modelDisplayLabel instead:
-#
-# endpoints:
-#   custom:
-#     - name: "OpenRouter"
-#       modelDisplayLabel: "Velorafy"
-#       apiKey: "${OPENROUTER_KEY}"
-#       baseURL: "https://openrouter.ai/api/v1"
-#       ...
+# 3) Endpoint name: no change needed. A custom endpoint with any name (e.g. "Velorafy Global")
+#    is treated by LibreChat agents as provider "openai", which receives MCP images correctly.

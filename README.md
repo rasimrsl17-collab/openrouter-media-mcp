@@ -50,7 +50,7 @@ OpenRouter xərci.
    kimi qoy (artıq override varsa, `openrouter-media` servisini ona əlavə et).
 4. LibreChat-ın `.env` faylına: `OPENROUTER_MEDIA_SECRET=<MCP_SHARED_SECRET ilə eyni dəyər>`
 5. `deploy/librechat.example.yaml`-dakı `mcpSettings` və `mcpServers` hissələrini `librechat.yaml`-a əlavə et.
-   OpenRouter endpoint-inin `name`-i `"OpenRouter"` qalmalıdır (səbəb faylda yazılıb).
+   Endpoint adını dəyişmək lazım deyil.
 6. `deploy/nginx.example.conf`-dakı `location` blokunu nginx-ə əlavə et, `nginx -t && systemctl reload nginx`.
 7. İşə sal:
    ```bash
