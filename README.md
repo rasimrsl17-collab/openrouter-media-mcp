@@ -39,7 +39,18 @@ Qoruma: X-API-Key gizli açarı, admin tərəfindən sabitlənmiş model siyahı
 gündəlik limit (X-User-ID), video uzunluğu/keyfiyyət tavanı, `usage.jsonl`-da hər çağırışın
 OpenRouter xərci.
 
-## Quraşdırma (VPS, LibreChat Docker ilə)
+## Avtomatik quraşdırma (LibreChat deploy-compose: LibreChat-API + LibreChat-NGINX)
+
+`.env` doldurulduqdan sonra:
+```bash
+cd /root/LibreChat
+bash openrouter-media-mcp/deploy/install-librechat-docker.sh
+```
+Skript backup götürür, konteyneri LibreChat şəbəkəsində işə salır, `librechat.yaml` və nginx-ə
+əlavələr edir, LibreChat-API-ni yenidən başladır və yoxlayır. Səhv olsa geri qaytarır.
+Təkrar işə salmaq təhlükəsizdir.
+
+## Əl ilə quraşdırma (VPS, LibreChat Docker ilə)
 
 1. Bu qovluğu (`openrouter-media-mcp/`) LibreChat-ın `docker-compose.yml` olan qovluğuna köçür.
 2. `.env.example` → `.env`, doldur:
