@@ -107,3 +107,28 @@ export function start(port) {
     const s = app.listen(port, () => r(s));
   });
 }
+
+// ---- Mock of LiteLLM's GET /customer/info (shapes taken from a real LiteLLM answer) ----
+export const customers = new Map(); // id -> { spend, max_budget, blocked }
+export const litellmSeen = [];
+const ll = express();
+ll.get('/customer/info', (req, res) => {
+  litellmSeen.push({ auth: req.get('authorization'), id: req.query.end_user_id });
+  if (req.get('authorization') !== 'Bearer cust-key') return res.status(401).json({ error: { message: 'no' } });
+  const id = req.query.end_user_id;
+  if (id === 'user-DOWN') return res.status(500).json({ error: 'boom' });
+  const c = customers.get(id);
+  if (!c) return res.status(400).json({ error: { message: `End User Id=${id} doesn't exist in db` } });
+  res.json({
+    user_id: id,
+    blocked: c.blocked ?? false,
+    spend: c.spend,
+    models: c.models ?? [],
+    litellm_budget_table: { max_budget: c.max_budget },
+  });
+});
+export function startLitellm(port) {
+  return new Promise((r) => {
+    const s = ll.listen(port, () => r(s));
+  });
+}

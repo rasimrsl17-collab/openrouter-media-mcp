@@ -67,6 +67,7 @@ function load() {
     state = {};
   }
   state.usage ??= {}; // { "2026-11-26": { "<userId>": { image: 3, video: 1, tts: 0 } } }
+  state.media ??= {}; // { "<userId>": total USD this server charged for media (never reset) }
   state.jobs ??= {}; // { "<jobId>": { userId, model, createdAt, fileName?, url? } }
   return state;
 }
@@ -103,6 +104,19 @@ export function consumeQuota(userId, kind, amount = 1) {
   s.usage[day][userId] ??= {};
   s.usage[day][userId][kind] = (s.usage[day][userId][kind] ?? 0) + amount;
   save();
+}
+
+/** Media spend charged to a user so far (USD, already multiplied by COST_MARKUP). */
+export function getMediaSpend(userId) {
+  return load().media[userId] ?? 0;
+}
+
+/** Adds (or, with a negative amount, refunds) media spend. The total never goes below 0. */
+export function addMediaSpend(userId, usd) {
+  const s = load();
+  s.media[userId] = Math.max(0, (s.media[userId] ?? 0) + usd);
+  save();
+  return s.media[userId];
 }
 
 export function rememberJob(jobId, info) {

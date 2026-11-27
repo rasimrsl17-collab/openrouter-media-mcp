@@ -7,12 +7,21 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { start, seen } from './mock-openrouter.js';
+import { start, seen, startLitellm, customers, litellmSeen } from './mock-openrouter.js';
 
 const MOCK_PORT = 4555;
 const MCP_PORT = 3499;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ormcp-'));
+const LL_PORT = 4556;
 const mock = await start(MOCK_PORT);
+const llMock = await startLitellm(LL_PORT);
+// two paying users with plenty of credit, a free user, and a nearly empty one
+customers.set('user-A', { spend: 1, max_budget: 100 });
+customers.set('user-B', { spend: 0, max_budget: 100 });
+customers.set('user-FREE', { spend: 0.0007, max_budget: 0.0012, models: ['gemma-3-4b-it'] });
+customers.set('user-C', { spend: 0, max_budget: 0.25 });
+customers.set('user-V', { spend: 0, max_budget: 10 });
+customers.set('user-BLOCKED', { spend: 0, max_budget: 100, blocked: true });
 
 const proc = spawn(process.execPath, ['src/index.js'], {
   env: {
@@ -28,6 +37,11 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     LIMIT_IMAGES_PER_DAY: '4',
     LIMIT_VIDEOS_PER_DAY: '2',
     VIDEO_POLL_SECONDS: '1',
+    LITELLM_URL: `http://127.0.0.1:${LL_PORT}`,
+    LITELLM_CUSTOMER_KEY: 'cust-key',
+    COST_MARKUP: '1.5',
+    ESTIMATE_IMAGE_USD: '0.08',
+    ESTIMATE_VIDEO_USD_PER_SECOND: '0.08',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -164,6 +178,79 @@ try {
   assert.ok(usage.some((u) => u.kind === 'image' && u.cost === 0.04));
   ok(`usage.jsonl has ${usage.length} entries with OpenRouter costs`);
 
+  // 12. credit check (LiteLLM customer budget) ----------------------------------------
+  const freeC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-FREE' });
+  const before = seen.filter((x) => x.path === '/images').length;
+  r = await freeC.callTool({ name: 'generate_image', arguments: { prompt: 'free user' } });
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text), JSON.stringify(r));
+  assert.equal(seen.filter((x) => x.path === '/images').length, before, 'OpenRouter must not be called for a free user');
+  r = await freeC.callTool({ name: 'generate_video', arguments: { prompt: 'v' } });
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text));
+  r = await freeC.callTool({ name: 'generate_speech', arguments: { text: 'salam' } });
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text));
+  assert.ok(litellmSeen.some((x) => x.auth === 'Bearer cust-key' && x.id === 'user-FREE'));
+  ok('free plan (0.0012 limit, model list restricted): image, video and speech are refused before OpenRouter is called');
+
+  const unknownC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-NEW' });
+  r = await unknownC.callTool({ name: 'generate_image', arguments: { prompt: 'x' } });
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text));
+  const blockedC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-BLOCKED' });
+  r = await blockedC.callTool({ name: 'generate_image', arguments: { prompt: 'x' } });
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text));
+  ok('user unknown to LiteLLM and blocked user are refused');
+
+  const downC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-DOWN' });
+  const calls = seen.filter((x) => x.path === '/images').length;
+  r = await downC.callTool({ name: 'generate_image', arguments: { prompt: 'x' } });
+  assert.ok(r.isError && /temporarily unavailable/.test(r.content[0].text));
+  assert.equal(seen.filter((x) => x.path === '/images').length, calls);
+  ok('LiteLLM failure -> fails closed, nothing generated');
+
+  // user-C: max 0.25, markup 1.5. Image costs 0.04 -> charged 0.06 each. Needs est 0.08*1.5 = 0.12.
+  const cC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-C' });
+  let generated = 0;
+  for (let i = 0; i < 20; i++) {
+    r = await cC.callTool({ name: 'generate_image', arguments: { prompt: 'c' + i } });
+    if (r.isError) break;
+    generated++;
+  }
+  assert.ok(r.isError && /Not enough credit/.test(r.content[0].text));
+  // remaining after n images = 0.25 - 0.06n; the next one needs 0.12 -> 0.07 < 0.12 after n = 3
+  assert.equal(generated, 3, `expected 3 images, got ${generated}`);
+  ok('credit is deducted per image (cost x 1.5) until the estimate no longer fits (3 images)');
+
+  // parallel calls cannot overspend: user-P has room for exactly one 0.12 estimate
+  customers.set('user-P', { spend: 0, max_budget: 0.15 });
+  const pC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-P' });
+  const pC2 = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-P' });
+  const both = await Promise.all([
+    pC.callTool({ name: 'generate_image', arguments: { prompt: 'p1' } }),
+    pC2.callTool({ name: 'generate_image', arguments: { prompt: 'p2' } }),
+  ]);
+  assert.equal(both.filter((x) => !x.isError).length, 1, 'only one of two parallel calls may pass');
+  ok('two parallel calls cannot both spend the same last credit');
+
+  // video: provisional charge corrected to the real cost (0.4 x 1.5 = 0.6)
+  const vC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-V' });
+  r = await vC.callTool({ name: 'generate_video', arguments: { prompt: 'a bird' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const st = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8'));
+  assert.ok(Math.abs(st.media['user-V'] - 0.6) < 1e-9, 'video charged at real cost x markup: ' + st.media['user-V']);
+  ok('video: provisional charge replaced by the real cost x markup (0.60)');
+
+  // speech: 11 chars * 0.03/1000 * 1.5
+  r = await vC.callTool({ name: 'generate_speech', arguments: { text: 'Salam dünya' } });
+  assert.ok(!r.isError);
+  const st2 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8'));
+  assert.ok(Math.abs(st2.media['user-V'] - (0.6 + (11 / 1000) * 0.03 * 1.5)) < 1e-9);
+  ok('speech charged by estimate x markup');
+
+  // raising max_budget (a purchase) immediately restores access
+  customers.set('user-FREE', { spend: 0.0007, max_budget: 5, models: [] });
+  r = await freeC.callTool({ name: 'generate_image', arguments: { prompt: 'after purchase' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  ok('after billing raises max_budget the same user can generate');
+
   await client.close();
   await clientB.close();
   console.log(`\nALL ${passed} CHECKS PASSED`);
@@ -174,4 +261,5 @@ try {
 } finally {
   proc.kill();
   mock.close();
+  llMock.close();
 }

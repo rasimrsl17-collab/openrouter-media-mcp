@@ -72,6 +72,30 @@ Təkrar işə salmaq təhlükəsizdir.
 8. Agent Builder → yeni agent → Tools → `openrouter-media` alətləri →
    Instructions: `deploy/agent-prompt.md`.
 
+## Kredit yoxlaması (LiteLLM limiti ilə)
+
+Media alətləri OpenRouter-ə birbaşa gedir, LiteLLM-i görmür. Ona görə server istifadəçinin limitini özü yoxlayır:
+
+`qalan = max_budget − spend (LiteLLM /customer/info) − bu serverin media üçün çıxdığı məbləğ`
+
+- Customer ID = LibreChat user ID (`X-User-ID`), eyni ID LiteLLM-də `x-litellm-customer-id` kimi gedir.
+- Pulsuz plan (customer-də `models` siyahısı doludur, məs. `[gemma]`) və ya limiti çatmayan istifadəçi OpenRouter çağırılmamış rədd edilir.
+- Şəkil: real xərc (`usage.cost`) × `COST_MARKUP` çıxılır. Video: göndərilərkən təxmini məbləğ tutulur, tamamlananda real xərclə düzəldilir, alınmasa geri qaytarılır. Səs: OpenRouter xərc qaytarmır, təxmini məbləğ (`ESTIMATE_TTS_USD_PER_1K_CHARS`) çıxılır.
+- Ödəniş edəndə billing `max_budget`-i artırır, hesab dərhal yenilənir. Paralel sorğular eyni krediti iki dəfə xərcləyə bilmir.
+- LiteLLM cavab vermirsə, heç nə yaradılmır (fail closed).
+- Media xərci LiteLLM panelində görünmür, `usage.jsonl` və `state.json`-dadır (LiteLLM-ə spend yazmaq olmur, yoxlanılıb: `/customer/update` `spend`-i qəbul etmir).
+
+Yalnız `/customer/info` çağıra bilən açar (master açar yox!) LiteLLM serverində belə yaradılır:
+
+```bash
+MK=$(docker exec litellm-litellm-1 printenv LITELLM_MASTER_KEY)
+curl -s -X POST http://localhost:4000/key/generate -H "Authorization: Bearer $MK" -H "Content-Type: application/json" \
+  -d '{"key_alias":"mcp-media-readonly","allowed_routes":["/customer/info"],"max_budget":0.01}'
+unset MK
+```
+
+Açarı `.env`-də `LITELLM_CUSTOMER_KEY`, LiteLLM ünvanını `LITELLM_URL` kimi yaz.
+
 ## Test
 
 ```bash

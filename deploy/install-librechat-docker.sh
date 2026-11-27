@@ -40,6 +40,13 @@ PUBLIC="$(env_val PUBLIC_BASE_URL)"
 if [ -z "$KEY" ] || [ "$KEY" = "sk-or-v1-..." ]; then red ".env: OPENROUTER_API_KEY doldurulmayıb"; exit 1; fi
 if [ -z "$SECRET" ] || [ "$SECRET" = "change-me" ] || [ "${#SECRET}" -lt 32 ]; then red ".env: MCP_SHARED_SECRET doldurulmayıb"; exit 1; fi
 case "$PUBLIC" in https://*) ;; *) red ".env: PUBLIC_BASE_URL https:// ilə başlamalıdır"; exit 1;; esac
+LL_URL="$(env_val LITELLM_URL)"
+LL_KEY="$(env_val LITELLM_CUSTOMER_KEY)"
+if [ "$(env_val BUDGET_DISABLED)" != "true" ]; then
+  if [ -z "$LL_URL" ] || [ -z "$LL_KEY" ] || [ "$LL_KEY" = "sk-..." ]; then
+    red ".env: LITELLM_URL və LITELLM_CUSTOMER_KEY doldurulmayıb (kredit yoxlaması üçün lazımdır, README-yə bax)"; exit 1
+  fi
+fi
 green "OK"
 
 TS="$(date +%Y%m%d-%H%M%S)"

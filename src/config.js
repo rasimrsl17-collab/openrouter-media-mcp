@@ -16,6 +16,14 @@ function int(name, fallback) {
   return Math.trunc(n);
 }
 
+function num(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${name} must be a non-negative number, got "${raw}"`);
+  return n;
+}
+
 export const config = {
   port: int('PORT', 3400),
   openrouterKey: process.env.OPENROUTER_API_KEY || '',
@@ -49,6 +57,19 @@ export const config = {
   allowedVideoResolutions: list('ALLOWED_VIDEO_RESOLUTIONS', '480p,720p'),
   maxTtsChars: int('MAX_TTS_CHARS', 3000),
 
+  // ---- Credit check (LiteLLM customer budgets) ----
+  // The user's remaining credit = max_budget - spend (both from LiteLLM /customer/info,
+  // customer id = X-User-ID) - what this server already charged for media.
+  litellmUrl: (process.env.LITELLM_URL || '').replace(/\/$/, ''),
+  litellmCustomerKey: process.env.LITELLM_CUSTOMER_KEY || '', // key allowed ONLY to call /customer/info
+  budgetDisabled: process.env.BUDGET_DISABLED === 'true', // never use in production
+  costMarkup: num('COST_MARKUP', 1), // charged = OpenRouter cost x markup
+  // Used only to refuse a call up front, and as the charge when OpenRouter reports no cost (speech).
+  estimateImageUsd: num('ESTIMATE_IMAGE_USD', 0.08), // per image
+  estimateVideoUsdPerSecond: num('ESTIMATE_VIDEO_USD_PER_SECOND', 0.08),
+  estimateTtsUsdPer1kChars: num('ESTIMATE_TTS_USD_PER_1K_CHARS', 0.03),
+  topupUrl: process.env.TOPUP_URL || '',
+
   // Video polling inside one tool call. Keep below LibreChat's MCP `timeout`.
   videoMaxWaitSeconds: int('VIDEO_MAX_WAIT_SECONDS', 240),
   videoPollSeconds: int('VIDEO_POLL_SECONDS', 6),
@@ -67,6 +88,11 @@ export function validateConfig() {
     problems.push('PUBLIC_BASE_URL is not set (needed to show videos/audio in the browser)');
   } else if (!config.publicBaseUrl.startsWith('https://') && !config.allowNoAuth) {
     problems.push('PUBLIC_BASE_URL must be https:// (browsers block http media on an https site)');
+  }
+  if (!config.budgetDisabled && (!config.litellmUrl || !config.litellmCustomerKey)) {
+    problems.push(
+      'LITELLM_URL and LITELLM_CUSTOMER_KEY are not set (credit check). Set BUDGET_DISABLED=true only for local tests',
+    );
   }
   if (!config.imageModels.length && !config.videoModels.length && !config.ttsModels.length) {
     problems.push('No models allowed at all');

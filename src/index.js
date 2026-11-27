@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { config, validateConfig } from './config.js';
+import { reserve } from './budget.js';
 import * as or from './openrouter.js';
 import {
   initStorage,
@@ -29,6 +30,7 @@ import {
   getJob,
   updateJob,
   logUsage,
+  addMediaSpend,
 } from './storage.js';
 
 const PCM_ONLY_PREFIXES = ['google/gemini', 'heygen/']; // per OpenRouter TTS docs: these return only pcm
@@ -122,8 +124,14 @@ async function finishVideo(jobId, job) {
   const { bytes, contentType } = await or.downloadVideo(jobId, 0);
   const saved = saveMedia(bytes, contentType);
   const patch = { fileName: saved.fileName, url: saved.url, mimeType: contentType.split(';')[0] };
+  // replace the provisional charge by the real one (OpenRouter reports usage.cost on completion)
+  const actual = typeof job?.usage?.cost === 'number' ? job.usage.cost * config.costMarkup : info?.charged ?? 0;
+  if (info?.userId && typeof info.charged === 'number') {
+    addMediaSpend(info.userId, actual - info.charged);
+    patch.charged = actual;
+  }
   updateJob(jobId, patch);
-  logUsage({ kind: 'video', userId: info?.userId, model: info?.model, jobId, cost: job?.usage?.cost ?? null });
+  logUsage({ kind: 'video', userId: info?.userId, model: info?.model, jobId, cost: job?.usage?.cost ?? null, charged: actual });
   return { ...info, ...patch };
 }
 
@@ -155,6 +163,12 @@ async function pollVideo(jobId, maxSeconds, signal) {
 async function videoOutcome(jobId, job) {
   if (job.status === 'completed') return videoReadyResult(jobId, await finishVideo(jobId, job));
   if (TERMINAL.has(job.status)) {
+    const info = getJob(jobId);
+    if (info?.userId && info.charged > 0) {
+      addMediaSpend(info.userId, -info.charged);
+      logUsage({ kind: 'video-refund', userId: info.userId, jobId, status: job.status, refunded: info.charged });
+      updateJob(jobId, { charged: 0 });
+    }
     const reason = job.error?.message || job.error || job.status;
     return fail(`Video generation ${job.status}: ${typeof reason === 'string' ? reason : JSON.stringify(reason)}`);
   }
@@ -202,6 +216,9 @@ function buildServer(userId) {
         const n = Math.min(args.n ?? 1, config.maxImagesPerCall);
         const q = checkQuota(userId, 'image', n);
         if (!q.ok) return quotaError('image', q);
+        const hold = await reserve(userId, config.estimateImageUsd * n);
+        if (!hold.ok) return fail(hold.message);
+        try {
 
         const body = { model: m.model, prompt: args.prompt, n, response_format: 'b64_json', user: userId };
         if (args.aspect_ratio) body.aspect_ratio = args.aspect_ratio;
@@ -237,7 +254,10 @@ function buildServer(userId) {
         }
 
         consumeQuota(userId, 'image', content.length);
-        logUsage({ kind: 'image', userId, model: m.model, count: content.length, cost: json?.usage?.cost ?? null });
+        const imgCost = typeof json?.usage?.cost === 'number' ? json.usage.cost : config.estimateImageUsd * content.length;
+        const imgCharged = imgCost * config.costMarkup;
+        addMediaSpend(userId, imgCharged);
+        logUsage({ kind: 'image', userId, model: m.model, count: content.length, cost: json?.usage?.cost ?? null, charged: imgCharged });
         content.unshift(
           text(
             `Generated ${content.length} image(s) with ${m.model}. They are already displayed to the user; do not repeat them as markdown.` +
@@ -245,6 +265,9 @@ function buildServer(userId) {
           ),
         );
         return { content };
+        } finally {
+          hold.release();
+        }
       },
     );
   }
@@ -343,16 +366,29 @@ function buildServer(userId) {
           ];
         }
 
+        // Hold the estimated cost; once the job exists it becomes a provisional charge that is
+        // corrected to the real cost on completion (or refunded if the job fails).
+        const estSeconds = body.duration ?? config.maxVideoSeconds;
+        const hold = await reserve(userId, config.estimateVideoUsdPerSecond * estSeconds);
+        if (!hold.ok) return fail(hold.message);
+
         let submitted;
         try {
           submitted = await or.submitVideo(body);
         } catch (err) {
+          hold.release();
           return orError(err);
         }
         const jobId = submitted?.id;
-        if (!jobId) return fail('OpenRouter did not return a job id.');
+        if (!jobId) {
+          hold.release();
+          return fail('OpenRouter did not return a job id.');
+        }
         consumeQuota(userId, 'video', 1);
-        rememberJob(jobId, { userId, model: m.model });
+        const provisional = config.estimateVideoUsdPerSecond * estSeconds * config.costMarkup;
+        addMediaSpend(userId, provisional);
+        hold.release();
+        rememberJob(jobId, { userId, model: m.model, charged: provisional });
 
         try {
           const job = await pollVideo(jobId, config.videoMaxWaitSeconds, extra?.signal);
@@ -413,6 +449,11 @@ function buildServer(userId) {
         }
         const q = checkQuota(userId, 'tts', 1);
         if (!q.ok) return quotaError('speech', q);
+        // OpenRouter returns no cost for speech, so the estimate is also what gets charged.
+        const ttsCost = (args.text.length / 1000) * config.estimateTtsUsdPer1kChars;
+        const hold = await reserve(userId, ttsCost);
+        if (!hold.ok) return fail(hold.message);
+        try {
 
         const voice = args.voice || (m.model === config.ttsModels[0] ? config.defaultTtsVoice : undefined);
         const body = { model: m.model, input: args.text, response_format: 'mp3' };
@@ -430,7 +471,9 @@ function buildServer(userId) {
         const saved = saveMedia(audio.bytes, mimeType);
         if (!saved.url) return fail('PUBLIC_BASE_URL is not configured, so the audio cannot be shown.');
         consumeQuota(userId, 'tts', 1);
-        logUsage({ kind: 'tts', userId, model: m.model, chars: args.text.length, generationId: audio.generationId });
+        const ttsCharged = ttsCost * config.costMarkup;
+        addMediaSpend(userId, ttsCharged);
+        logUsage({ kind: 'tts', userId, model: m.model, chars: args.text.length, generationId: audio.generationId, charged: ttsCharged });
 
         return {
           content: [
@@ -441,6 +484,9 @@ function buildServer(userId) {
             playerResource('audio', saved.fileName.split('.')[0], saved.url, mimeType),
           ],
         };
+        } finally {
+          hold.release();
+        }
       },
     );
   }
