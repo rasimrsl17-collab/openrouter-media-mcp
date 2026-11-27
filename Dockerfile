@@ -3,6 +3,11 @@ FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
+# ffmpeg (with libass) builds the Shorts; DejaVu covers Latin incl. Azerbaijani/Turkish letters, Cyrillic, Greek
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 

@@ -74,6 +74,22 @@ export const config = {
   videoMaxWaitSeconds: int('VIDEO_MAX_WAIT_SECONDS', 240),
   videoPollSeconds: int('VIDEO_POLL_SECONDS', 6),
 
+  // ---- Creator Studio: assemble_short (ffmpeg) ----
+  limitShortsPerDay: int('LIMIT_SHORTS_PER_DAY', 5), // 0 disables assemble_short
+  maxShortSeconds: int('MAX_SHORT_SECONDS', 90),
+  maxConcurrentRenders: int('MAX_CONCURRENT_RENDERS', 1), // ffmpeg is CPU-heavy on a small VPS
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+  ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
+  captionFont: process.env.CAPTION_FONT || 'DejaVu Sans',
+
+  // ---- Creator Studio: publishing through Zernio (empty key = social tools disabled) ----
+  zernioKey: process.env.ZERNIO_API_KEY || '',
+  zernioBaseUrl: (process.env.ZERNIO_BASE_URL || 'https://zernio.com/api/v1').replace(/\/$/, ''),
+  socialRedirectUrl: process.env.SOCIAL_REDIRECT_URL || '', // where users land after connecting an account
+  socialPlatforms: list('SOCIAL_PLATFORMS', 'youtube,tiktok,instagram,facebook,linkedin,pinterest,threads'),
+  limitPostsPerDay: int('LIMIT_POSTS_PER_DAY', 10),
+  socialPostFeeUsd: num('SOCIAL_POST_FEE_USD', 0), // charged per published post (pass your Zernio cost on)
+
   // LibreChat rejects MCP images above 10 MB (MCP_IMAGE_DATA_MAX_BYTES); stay safely below.
   previewMaxBytes: int('PREVIEW_MAX_BYTES', 8 * 1024 * 1024),
 };
