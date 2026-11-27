@@ -34,6 +34,10 @@ LibreChat agentlərinə alət kimi verən MCP server.
 | `check_video_status` | job_id ilə nəticəni alır (yalnız job-u yaradan istifadəçi) |
 | `generate_speech` | Mətndən MP3 səs + pleyer |
 | `list_media_models` | İcazəli modellər, parametrlər, səslər |
+| `assemble_short` | Səhnələr + səsləndirmə + altyazı → hazır 1080x1920 MP4 (Shorts/TikTok/Reels), ffmpeg, AI xərci yoxdur |
+| `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Zernio OAuth) |
+| `social_list_accounts` | İstifadəçinin YALNIZ öz qoşulmuş hesabları |
+| `social_publish` | İndi paylaş / vaxta planla / qaralama — yalnız öz hesablarına, yalnız bu serverin yaratdığı media |
 
 Qoruma: X-API-Key gizli açarı, admin tərəfindən sabitlənmiş model siyahısı, hər istifadəçiyə
 gündəlik limit (X-User-ID), video uzunluğu/keyfiyyət tavanı, `usage.jsonl`-da hər çağırışın
@@ -71,6 +75,31 @@ Təkrar işə salmaq təhlükəsizdir.
    ```
 8. Agent Builder → yeni agent → Tools → `openrouter-media` alətləri →
    Instructions: `deploy/agent-prompt.md`.
+
+## Creator Studio (avtopilot: ideya → hazır video → paylaşım)
+
+**Necə işləyir:** agent ssenari yazır → `generate_image` ilə 9:16 səhnələr → `generate_speech` ilə səs →
+`assemble_short` hamısını altyazılı bir videoya yığır → istifadəçi təsdiqləyəndən sonra `social_publish`.
+Agentin təlimatı: [`deploy/creator-agent-prompt.md`](deploy/creator-agent-prompt.md).
+
+**assemble_short**
+- Yalnız bu serverin öz `/media/` faylları qəbul olunur (kənar URL, `../` hiylələri rədd edilir).
+- Səs səhnələrdən uzundursa, son səhnə səs bitənə qədər uzadılır — nitq kəsilmir.
+- Altyazı ASS ilə yandırılır (DejaVu Sans Bold; ə, ğ, ş, ç, ı, ö, ü düzgün görünür).
+- `MAX_CONCURRENT_RENDERS=1` — kiçik droplet-də eyni anda bir video kodlanır, qalanlar növbə gözləyir.
+
+**Paylaşım (Zernio, multi-tenant)**
+1. zernio.com-da qeydiyyat → API açarı (`sk_...`) → `.env`-də `ZERNIO_API_KEY`.
+2. Hər LibreChat istifadəçisi üçün avtomatik ayrıca Zernio profili yaradılır (`externalId` = istifadəçi id).
+3. İstifadəçi hesabını Zernio-nun OAuth linki ilə özü qoşur — parolunu biz görmürük.
+4. Zernio `/v1/posts` iş sahəsindəki İSTƏNİLƏN hesabı qəbul edir; ona görə server hər paylaşımdan
+   əvvəl hər `account_id`-nin bu istifadəçinin profilinə aid olduğunu yoxlayır.
+5. `SOCIAL_POST_FEE_USD` — Zernio xərcini müştəriyə ötürmək üçün hər hesaba hər paylaşımda tutulan
+   məbləğ (× `COST_MARKUP`). Tam uğursuz paylaşım (HTTP 207, status `failed`) pulsuzdur.
+
+**Diqqət:** Zernio-nun pulsuz planı 2 sosial hesabla məhdudlaşır (bütün istifadəçilər birlikdə) —
+real müştərilər gələndə hesab başına ödənişli plana keçmək lazımdır. `SOCIAL_PLATFORMS`-ə yeni
+platforma əlavə etməzdən əvvəl Zernio sənədində onun dəqiq id-sini yoxla.
 
 ## Kredit yoxlaması (LiteLLM limiti ilə)
 

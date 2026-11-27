@@ -31,7 +31,10 @@ import {
   updateJob,
   logUsage,
   addMediaSpend,
+  localMediaPath,
 } from './storage.js';
+import { renderShort, kindOf, StudioError } from './studio.js';
+import * as social from './social.js';
 
 const PCM_ONLY_PREFIXES = ['google/gemini', 'heygen/']; // per OpenRouter TTS docs: these return only pcm
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'expired']);
@@ -484,6 +487,202 @@ function buildServer(userId) {
             playerResource('audio', saved.fileName.split('.')[0], saved.url, mimeType),
           ],
         };
+        } finally {
+          hold.release();
+        }
+      },
+    );
+  }
+
+  // ----- Creator Studio: assemble a vertical short -----
+  if (config.limitShortsPerDay > 0) {
+    server.registerTool(
+      'assemble_short',
+      {
+        title: 'Assemble short video',
+        description:
+          'Combine scenes (images and/or video clips made earlier with generate_image / generate_video) plus an optional ' +
+          'voiceover (from generate_speech) and per-scene captions into ONE vertical 1080x1920 MP4 for YouTube Shorts, ' +
+          'TikTok and Reels. Use the full-size /media/ links those tools returned. If the voiceover is longer than the ' +
+          `scenes, the last scene is held until the speech ends. Max ${config.maxShortSeconds}s. No extra AI cost.`,
+        inputSchema: {
+          scenes: z
+            .array(
+              z.object({
+                media_url: z.string().url().describe('A /media/ link returned by generate_image or generate_video'),
+                seconds: z.number().min(1).max(20).describe('How long this scene is shown'),
+                caption: z.string().max(160).optional().describe('On-screen text for this scene (short, punchy)'),
+              }),
+            )
+            .min(1)
+            .max(15),
+          voiceover_url: z.string().url().optional().describe('The /media/ mp3 link returned by generate_speech'),
+        },
+      },
+      async (args) => {
+        const q = checkQuota(userId, 'short', 1);
+        if (!q.ok) return quotaError('short video', q);
+        const scenes = [];
+        for (const [i, s] of args.scenes.entries()) {
+          const file = localMediaPath(s.media_url);
+          const kind = file && kindOf(file);
+          if (!file || (kind !== 'image' && kind !== 'video')) {
+            return fail(`Scene ${i + 1}: use an image or video link created by this server's tools (…/media/…); got ${s.media_url}`);
+          }
+          scenes.push({ file, kind, seconds: s.seconds, caption: s.caption });
+        }
+        let voiceFile;
+        if (args.voiceover_url) {
+          voiceFile = localMediaPath(args.voiceover_url);
+          if (!voiceFile || kindOf(voiceFile) !== 'audio') {
+            return fail('voiceover_url must be an audio link created by generate_speech (…/media/….mp3).');
+          }
+        }
+        let out;
+        try {
+          out = await renderShort({ scenes, voiceFile });
+        } catch (err) {
+          if (err instanceof StudioError) return fail(err.message);
+          console.error('[assemble_short]', err);
+          return fail(`Could not build the video: ${err?.message || err}`);
+        }
+        const saved = saveMedia(out.bytes, 'video/mp4');
+        if (!saved.url) return fail('PUBLIC_BASE_URL is not configured, so the video cannot be shown.');
+        consumeQuota(userId, 'short', 1);
+        logUsage({ kind: 'short', userId, seconds: out.seconds, scenes: scenes.length });
+        return {
+          content: [
+            text(
+              `Short video ready (${out.seconds.toFixed(1)}s, 1080x1920). Show it by placing the UI Resource Marker given below ` +
+                `in your reply, and give the download link. Use this exact link as video_url when publishing: ${saved.url}`,
+            ),
+            playerResource('video', saved.fileName.split('.')[0], saved.url, 'video/mp4'),
+          ],
+        };
+      },
+    );
+  }
+
+  // ----- Creator Studio: social publishing (Zernio) -----
+  if (config.zernioKey && config.limitPostsPerDay > 0) {
+    const anon = () => fail('Publishing needs a signed-in user. Ask the user to sign in again.');
+    const socialFail = (err) => {
+      if (err instanceof social.SocialError) return fail(`Publishing service error${err.status ? ` (HTTP ${err.status})` : ''}: ${err.message}`);
+      console.error('[social]', err);
+      return fail(`Unexpected publishing error: ${err?.message || err}`);
+    };
+
+    if (config.socialPlatforms.length) server.registerTool(
+      'social_connect_account',
+      {
+        title: 'Connect a social account',
+        description:
+          "Get a secure link where the user connects their OWN social media account (they log in on the platform's site; " +
+          `we never see their password). Platforms: ${config.socialPlatforms.join(', ')}. Give the link to the user and ` +
+          'ask them to tell you when they are done, then call social_list_accounts.',
+        inputSchema: { platform: z.enum(config.socialPlatforms) },
+      },
+      async ({ platform }) => {
+        if (userId === 'anonymous') return anon();
+        try {
+          const url = await social.connectUrl(userId, platform);
+          return { content: [text(`Give the user this link to connect their ${platform} account (valid for a limited time): ${url}`)] };
+        } catch (err) {
+          return socialFail(err);
+        }
+      },
+    );
+
+    server.registerTool(
+      'social_list_accounts',
+      {
+        title: 'List connected social accounts',
+        description: "List the user's own connected social accounts with the account_id needed for social_publish.",
+        inputSchema: {},
+      },
+      async () => {
+        if (userId === 'anonymous') return anon();
+        try {
+          const accounts = await social.listAccounts(userId);
+          if (!accounts.length) {
+            return { content: [text('No accounts connected yet. Offer social_connect_account for the platform the user wants.')] };
+          }
+          return { content: [text(JSON.stringify(accounts, null, 1))] };
+        } catch (err) {
+          return socialFail(err);
+        }
+      },
+    );
+
+    server.registerTool(
+      'social_publish',
+      {
+        title: 'Publish or schedule a post',
+        description:
+          "Publish, schedule or save as draft a video/images to the user's connected accounts. ONLY call this after the user " +
+          'has seen the final video and caption and explicitly said yes to posting them to the named accounts. ' +
+          'Media must be links created by this server (e.g. the assemble_short result).' +
+          (config.socialPostFeeUsd > 0 ? ` Costs $${config.socialPostFeeUsd} credit per published post.` : ''),
+        inputSchema: {
+          media_urls: z.array(z.string().url()).min(1).max(10).describe('Usually one: the assemble_short video link'),
+          caption: z.string().min(1).max(2200).describe('Post text with hashtags; first line is used as the YouTube title if none given'),
+          targets: z
+            .array(
+              z.object({
+                account_id: z.string().min(1).describe('From social_list_accounts'),
+                youtube_title: z.string().max(100).optional(),
+              }),
+            )
+            .min(1)
+            .max(10),
+          mode: z.enum(['now', 'schedule', 'draft']).describe('now = publish immediately; schedule = at scheduled_for; draft = save only'),
+          scheduled_for: z.string().optional().describe('ISO 8601 time, required for mode=schedule, e.g. 2026-12-01T18:00:00'),
+          timezone: z.string().optional().describe('IANA zone for scheduled_for without offset, e.g. America/New_York'),
+        },
+      },
+      async (args) => {
+        if (userId === 'anonymous') return anon();
+        if (args.mode === 'schedule' && !args.scheduled_for) return fail('scheduled_for is required when mode is schedule.');
+        for (const u of args.media_urls) {
+          if (!localMediaPath(u)) return fail(`Only media created by this server can be published; ${u} is not one.`);
+        }
+        const q = checkQuota(userId, 'post', 1);
+        if (!q.ok) return quotaError('post', q);
+        const fee = args.mode === 'draft' ? 0 : config.socialPostFeeUsd * args.targets.length;
+        const hold = fee > 0 ? await reserve(userId, fee) : { ok: true, release() {} };
+        if (!hold.ok) return fail(hold.message);
+        try {
+          const r = await social.publish(userId, {
+            mediaUrls: args.media_urls,
+            caption: args.caption,
+            targets: args.targets,
+            mode: args.mode,
+            scheduledFor: args.scheduled_for,
+            timezone: args.timezone,
+          });
+          const failed = r.httpStatus === 207 && r.status === 'failed';
+          if (!failed) {
+            consumeQuota(userId, 'post', 1);
+            if (fee > 0) addMediaSpend(userId, fee * config.costMarkup);
+          }
+          logUsage({ kind: 'post', userId, mode: args.mode, postId: r.postId, status: r.status, targets: args.targets.length, charged: failed ? 0 : fee * config.costMarkup });
+          const summary = { post_id: r.postId, status: r.status, platforms: r.platforms, error: r.error, warnings: r.warnings };
+          return {
+            ...(failed ? { isError: true } : {}),
+            content: [
+              text(
+                (failed
+                  ? 'Publishing FAILED on every platform. Explain the error to the user in simple words.'
+                  : r.httpStatus === 207
+                    ? 'Published on some platforms only. Tell the user which ones failed and why.'
+                    : `Done (${args.mode}).`) +
+                  '\n' +
+                  JSON.stringify(summary, null, 1).slice(0, 4000),
+              ),
+            ],
+          };
+        } catch (err) {
+          return socialFail(err);
         } finally {
           hold.release();
         }

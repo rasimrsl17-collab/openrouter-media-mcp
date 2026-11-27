@@ -132,3 +132,37 @@ export function startLitellm(port) {
     const s = ll.listen(port, () => r(s));
   });
 }
+
+// ---- Mock of Zernio's multi-tenant API (shapes from docs.zernio.com/multi-tenant and /posts/create-post) ----
+export const zernioSeen = [];
+export const zernio = { profiles: [], accounts: [], posts: [] };
+const zn = express();
+zn.use(express.json());
+zn.use((req, res, next) => {
+  zernioSeen.push({ method: req.method, path: req.path, query: req.query, body: req.body, idem: req.get('idempotency-key') });
+  if (req.get('authorization') !== 'Bearer zn-key') return res.status(401).json({ error: 'unauthorized' });
+  next();
+});
+zn.get('/profiles', (req, res) => res.json({ profiles: zernio.profiles.filter((p) => p.externalId === req.query.externalId) }));
+zn.post('/profiles', (req, res) => {
+  const profile = { _id: `prof_${zernio.profiles.length + 1}`, name: req.body.name, externalId: req.body.externalId };
+  zernio.profiles.push(profile);
+  res.status(201).json({ profile });
+});
+zn.get('/connect/:platform', (req, res) =>
+  res.json({ authUrl: `https://auth.example/${req.params.platform}?p=${req.query.profileId}`, state: 's' }),
+);
+zn.get('/accounts', (req, res) => res.json({ accounts: zernio.accounts.filter((a) => a.profileId === req.query.profileId) }));
+zn.post('/posts', (req, res) => {
+  if (req.body.content.includes('FAILALL')) {
+    return res.status(207).json({ post: { _id: 'post_x', status: 'failed', platforms: [] }, error: 'video too long for tiktok' });
+  }
+  const post = { _id: `post_${zernio.posts.length + 1}`, status: req.body.isDraft ? 'draft' : req.body.publishNow ? 'published' : 'scheduled', platforms: req.body.platforms };
+  zernio.posts.push({ ...post, body: req.body });
+  res.status(201).json({ message: 'ok', post });
+});
+export function startZernio(port) {
+  return new Promise((r) => {
+    const s = zn.listen(port, () => r(s));
+  });
+}
