@@ -9,6 +9,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { execFileSync } from 'node:child_process';
 import { start, seen, startLitellm, customers, litellmSeen, startPostForMe, pfm, pfmSeen, sttSeen } from './mock-openrouter.js';
+import sharp from 'sharp';
+const sharpMeta = (b) => sharp(b).metadata();
 
 const MOCK_PORT = 4555;
 const MCP_PORT = 3499;
@@ -59,6 +61,10 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     LIMIT_CLIPS_PER_DAY: '3',
     MAX_CLIPS_PER_CALL: '2',
     SOURCE_WAIT_SECONDS: '60',
+    LIMIT_LONG_VIDEOS_PER_DAY: '2',
+    MAX_LONG_MINUTES: '1',
+    LONG_WAIT_SECONDS: '120',
+    LIMIT_THUMBNAILS_PER_DAY: '2',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -91,8 +97,8 @@ try {
   const client = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-A' });
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
-    'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_video_transcript', 'list_media_models',
-    'social_connect_account', 'social_list_accounts', 'social_post_status', 'social_publish', 'transcribe_video',
+    'assemble_long', 'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_long_video',
+    'get_video_transcript', 'list_media_models', 'make_thumbnail', 'social_connect_account', 'social_list_accounts', 'social_post_status', 'social_publish', 'transcribe_video',
   ]);
   ok('tools listed: ' + tools.join(', '));
 
@@ -342,6 +348,81 @@ try {
   r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 1 }] } });
   assert.ok(r.isError && /Daily short video limit/.test(r.content[0].text), JSON.stringify(r));
   ok('daily short-video limit enforced (4)');
+
+  // ---- long horizontal video + thumbnail ----
+  const lC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-L' });
+  customers.set('user-L', { spend: 0, max_budget: 10 });
+  const wide = 'b'.repeat(32) + '.png';
+  const tall = 'c'.repeat(32) + '.png';
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1600x900', '-frames:v', '1', path.join(tmp, 'media', wide)]);
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=600x900', '-frames:v', '1', path.join(tmp, 'media', tall)]);
+  const wideUrl = `http://127.0.0.1:${MCP_PORT}/media/${wide}`;
+  const tallUrl = `http://127.0.0.1:${MCP_PORT}/media/${tall}`;
+  const sttL = sttSeen.length;
+  const t0 = Date.now();
+  r = await lC.callTool({
+    name: 'assemble_long',
+    arguments: {
+      title: 'Roma necə yıxıldı',
+      music: 'calm',
+      language: 'az',
+      sections: [
+        { voiceover_url: voiceUrl, media_urls: [wideUrl, tallUrl], heading: 'Fəsil 1: Başlanğıc' },
+        { voiceover_url: voiceUrl, media_urls: [wideUrl] },
+      ],
+    },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const longUrl = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp4/)[0];
+  assert.ok(r.content.some((c) => c.type === 'resource' && c.resource.text.includes('<video')));
+  const lp = JSON.parse(
+    execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json', path.join(tmp, 'media', longUrl.split('/').pop())]).toString(),
+  );
+  const lv = lp.streams.find((x) => x.codec_type === 'video');
+  assert.deepEqual([lv.width, lv.height], [1920, 1080]);
+  assert.ok(lp.streams.some((x) => x.codec_type === 'audio'));
+  const ld = Number(lp.format.duration);
+  assert.ok(Math.abs(ld - 12.2) < 0.4, 'two sections of 5.5 s voice + 0.6 s tail each, got ' + ld);
+  assert.equal(sttSeen.length - sttL, 2, 'subtitles: one STT call per section');
+  ok(`assemble_long -> 1920x1080, ${ld.toFixed(2)}s, 2 sections, subtitles + heading + title + music, rendered in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+  const longJob = fs.readdirSync(path.join(tmp, 'state', 'longs'))[0].replace('.json', '');
+  r = await sC.callTool({ name: 'get_long_video', arguments: { job_id: longJob } });
+  assert.ok(r.isError && /Unknown job_id/.test(r.content[0].text), 'other users cannot read the job');
+  r = await lC.callTool({ name: 'get_long_video', arguments: { job_id: longJob } });
+  assert.ok(!r.isError && r.content[0].text.includes(longUrl));
+  ok('get_long_video returns the finished video only to its owner');
+
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: [{ voiceover_url: voiceUrl, media_urls: Array(5).fill(wideUrl) }] } });
+  assert.ok(r.isError && /too many/.test(r.content[0].text), JSON.stringify(r));
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: [{ voiceover_url: voiceUrl, media_urls: ['https://evil.example/a.png'] }] } });
+  assert.ok(r.isError && /created by this server/.test(r.content[0].text));
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: Array(11).fill({ voiceover_url: voiceUrl, media_urls: [wideUrl] }) } });
+  assert.ok(r.isError && /at most 1 min/.test(r.content[0].text), JSON.stringify(r));
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: [{ voiceover_url: wideUrl, media_urls: [wideUrl] }] } });
+  assert.ok(r.isError && /audio link/.test(r.content[0].text));
+  ok('assemble_long rejects too many pictures per voice, foreign links, over-length videos and non-audio voices');
+
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: [{ voiceover_url: voiceUrl, media_urls: [tallUrl] }], subtitles: false, motion: false } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  r = await lC.callTool({ name: 'assemble_long', arguments: { sections: [{ voiceover_url: voiceUrl, media_urls: [tallUrl] }] } });
+  assert.ok(r.isError && /Daily long video limit/.test(r.content[0].text), JSON.stringify(r));
+  ok('daily long-video limit enforced (2); rejected requests do not count');
+
+  r = await lC.callTool({ name: 'make_thumbnail', arguments: { image_url: wideUrl, text: 'Roma *necə* yıxıldı?', position: 'left', color: 'yellow' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const thumbImg = r.content.find((c) => c.type === 'image');
+  assert.equal(thumbImg.mimeType, 'image/jpeg');
+  const thumbBytes = Buffer.from(thumbImg.data, 'base64');
+  const tm = await sharpMeta(thumbBytes);
+  assert.deepEqual([tm.width, tm.height, tm.format], [1280, 720, 'jpeg']);
+  assert.ok(thumbBytes.length < 2_000_000);
+  assert.ok(/\/media\/[a-f0-9]{32}\.jpg/.test(r.content[0].text));
+  r = await lC.callTool({ name: 'make_thumbnail', arguments: { image_url: tallUrl, text: 'Bir çox sözdən ibarət çox uzun başlıq mətni burada', position: 'bottom', color: 'red', uppercase: false } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  r = await lC.callTool({ name: 'make_thumbnail', arguments: { image_url: voiceUrl, text: 'x' } });
+  assert.ok(r.isError, 'audio is not an image');
+  ok('make_thumbnail -> 1280x720 JPEG < 2 MB with accent words; long text wraps; non-images rejected');
 
 
   // ---- long video -> clips ----

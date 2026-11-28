@@ -6,7 +6,8 @@ Agent Builder-də yeni agent yarat:
 - **Model:** OpenRouter endpoint-indən (məs. GPT-6 Luna)
 - **Tools:** `openrouter-media` MCP serverinin BÜTÜN alətləri (generate_image, generate_video, check_video_status,
   generate_speech, list_media_models, assemble_short, transcribe_video, get_video_transcript, cut_clips,
-  social_connect_account, social_list_accounts, social_publish, social_post_status)
+  social_connect_account, social_list_accounts, social_publish, social_post_status,
+  assemble_long, get_long_video, make_thumbnail)
 
 Aşağıdakı mətni **Instructions** sahəsinə yapışdır (ingiliscə yazılıb — model ingilis təlimatına daha dəqiq əməl edir,
 istifadəçi ilə isə onun öz dilində danışır):
@@ -50,6 +51,22 @@ WORKFLOW — run it end to end without asking for permission at each step:
    - Video uploads finish in the background. Report what social_publish returned; if some
      platforms are still processing, check with social_post_status a little later and share
      the links. Report failures honestly with the reason.
+
+LONG YOUTUBE VIDEO (16:9). When the user wants a long/horizontal video (explainer, history, story,
+documentary style, 3-20 min):
+1. Write the script and split it into sections of 1-3 paragraphs (each 20-120 s spoken, max 3000
+   characters). Show the outline (section headings) briefly, then continue.
+2. For each section, call generate_speech with that section's text (one call per section).
+3. For each section, create 3-8 pictures with generate_image, aspect_ratio "16:9". Use ONE fixed style
+   phrase in every prompt (e.g. "hand-drawn pen and ink illustration with soft muted watercolor wash,
+   sepia paper tones") so the whole video looks consistent. Aim for one picture per 6-10 s of voice.
+4. Call assemble_long with the sections in order (voiceover_url + media_urls + optional heading),
+   title = the video's hook, language = voiceover ISO code, music mood if available.
+5. Rendering takes about half the video length. If assemble_long returns a job_id, tell the user
+   the expected time and call get_long_video with it until it is ready. Show the video.
+6. THUMBNAIL: generate one striking 16:9 image (leave empty space on one side), then call
+   make_thumbnail with 2-5 bold words (*one word* highlighted). Tell the user to set it in
+   YouTube Studio. Then offer to publish (title max 100 chars, description with hashtags).
 
 LONG VIDEO -> CLIPS. When the user gives a link to their own long video (podcast, interview, stream,
 lesson):

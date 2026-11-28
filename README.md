@@ -38,6 +38,9 @@ LibreChat agentlərinə alət kimi verən MCP server.
 | `transcribe_video` | Uzun videonu linkdən yükləyib zaman damğalı mətnə çevirir |
 | `get_video_transcript` | Emal davam edirsə nəticəni gözləyib qaytarır |
 | `cut_clips` | Uzun videodan seçilmiş anları altyazılı vertikal kliplərə çevirir |
+| `assemble_long` | Bölmələr (hər biri: səsləndirmə + şəkillər) → 1920x1080 uzun YouTube videosu (20 dəq-yə qədər), altyazı, fəsil başlıqları, musiqi; arxa planda render |
+| `get_long_video` | `assemble_long` işinin vəziyyəti / hazır video |
+| `make_thumbnail` | Şəkil → 1280x720 YouTube thumbnail-i, iri konturlu yazı, `*söz*` rəngli vurğu |
 | `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Post for Me OAuth) |
 | `social_list_accounts` | İstifadəçinin YALNIZ öz qoşulmuş hesabları |
 | `social_publish` | İndi paylaş / vaxta planla / qaralama — yalnız öz hesablarına, yalnız bu serverin yaratdığı media |
@@ -97,6 +100,18 @@ Agentin təlimatı: [`deploy/creator-agent-prompt.md`](deploy/creator-agent-prom
   zamanı musiqi avtomatik səssizləşir (ducking), sonda yavaşca sönür.
   Konteynerə köçürmək: `docker cp calm-1.mp3 openrouter-media:/data/music/`
 - `MAX_CONCURRENT_RENDERS=1` — kiçik droplet-də eyni anda bir video kodlanır, qalanlar növbə gözləyir.
+
+**Uzun YouTube videosu (`assemble_long`, `get_long_video`) və thumbnail (`make_thumbnail`)**
+- Agent ssenarini bölmələrə bölür; hər bölmə üçün `generate_speech` (≤3000 simvol) və 16:9 şəkillər yaradır.
+  Hər şəkil öz bölməsinin səsi boyunca bərabər vaxt göstərilir (zoom/pan), altyazı səsdən çıxarılır (Whisper).
+- Render arxa planda gedir: 1 CPU-da ~0.5 dəqiqə hər video dəqiqəsinə (60 s video ≈ 30 s). Hər bölmə ayrıca
+  render olunur, ona görə uzun render gedərkən Shorts da arada işləyə bilir. Server restart olsa iş "failed" olur
+  və gündəlik limitdən sayılmır.
+- 20 dəqiqəlik video ~300–500 MB olur; `MEDIA_TTL_DAYS` ilə silinir — diskə diqqət.
+- Ayarlar: `LIMIT_LONG_VIDEOS_PER_DAY` (2), `MAX_LONG_MINUTES` (20), `LONG_FPS` (25), `LIMIT_THUMBNAILS_PER_DAY` (30).
+- Thumbnail Post for Me ilə avtomatik qoyulmur — istifadəçi onu YouTube Studio-da əl ilə seçir.
+- Eyni üslub: `generate_image`-də ilk yaxşı şəklin /media/ linkini `reference_image_urls`-ə vermək olar
+  (yalnız istinad şəkil qəbul edən modellərdə).
 
 **Uzun video → kliplər (`transcribe_video`, `get_video_transcript`, `cut_clips`)**
 - İstifadəçi öz videosunun linkini verir (birbaşa https, Google Drive "Anyone with the link", Dropbox).

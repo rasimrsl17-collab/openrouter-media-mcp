@@ -38,6 +38,7 @@ import { renderShort, renderClip, kindOf, listMusic, pickMusic, StudioError } fr
 import * as clips from './clips.js';
 import { transcribeVoice } from './clips.js';
 import * as social from './social.js';
+import * as longform from './longform.js';
 
 const PCM_ONLY_PREFIXES = ['google/gemini', 'heygen/']; // per OpenRouter TTS docs: these return only pcm
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'expired']);
@@ -202,7 +203,9 @@ function buildServer(userId) {
         description:
           'Generate images from a text prompt via OpenRouter. The image is shown to the user automatically. ' +
           `Allowed models: ${config.imageModels.join(', ')} (default ${config.imageModels[0]}). ` +
-          'Write the prompt in English for best results, describing subject, style, lighting and composition.',
+          'Write the prompt in English for best results, describing subject, style, lighting and composition. ' +
+          'For a series of scenes in ONE consistent style, repeat the same style words in every prompt, and pass the /media/ ' +
+          'link of the first good image in reference_image_urls (with "same art style as the reference") when the model supports it.',
         inputSchema: {
           prompt: z.string().min(1).describe('Detailed description of the image'),
           model: z.string().optional().describe('One of the allowed image models; omit for default'),
@@ -213,7 +216,10 @@ function buildServer(userId) {
             .array(z.string().url())
             .max(8)
             .optional()
-            .describe('Public https image URLs to use as references / for editing (model must support it)'),
+            .describe(
+              'Image URLs to use as references (e.g. a /media/ link of an earlier image) to keep the same style or ' +
+                'character across scenes, or to edit an image. Only some models accept references; see list_media_models.',
+            ),
         },
       },
       async (args) => {
@@ -597,6 +603,207 @@ function buildServer(userId) {
                 `in your reply, and give the download link. Use this exact link as video_url when publishing: ${saved.url}`,
             ),
             playerResource('video', saved.fileName.split('.')[0], saved.url, 'video/mp4'),
+          ],
+        };
+      },
+    );
+  }
+
+  // ----- Creator Studio: long horizontal video (YouTube) -----
+  if (config.limitLongVideosPerDay > 0) {
+    const longReply = (job) => {
+      if (!job) return fail('Unknown job_id. Start again with assemble_long.');
+      if (job.status === 'failed') return fail(`Building the long video failed: ${job.error}`);
+      if (job.status !== 'ready') {
+        const etaMin = Math.max(1, Math.round((job.seconds * 0.9) / 60));
+        return {
+          content: [
+            text(
+              `The long video is still being built (status: ${job.status}, ${job.progress}; job_id: ${job.id}; ` +
+                `${(job.seconds / 60).toFixed(1)} min of video usually takes about ${etaMin} min to render). Tell the user it is in ` +
+                'progress and roughly how long it takes, then call get_long_video with this job_id (each call waits a few minutes).',
+            ),
+          ],
+        };
+      }
+      if (!job.url) return fail('PUBLIC_BASE_URL is not configured, so the video cannot be shown.');
+      return {
+        content: [
+          text(
+            `Long video ready (${(job.seconds / 60).toFixed(1)} min, 1920x1080). Show it by placing the UI Resource Marker given below ` +
+              `in your reply, and give the download link. Use this exact link as video_url when publishing: ${job.url}`,
+          ),
+          playerResource('video', job.fileName.split('.')[0], job.url, 'video/mp4'),
+        ],
+      };
+    };
+
+    server.registerTool(
+      'assemble_long',
+      {
+        title: 'Assemble long horizontal video',
+        description:
+          'Build ONE horizontal 1920x1080 MP4 for YouTube (explainer / story / history-channel style, up to ' +
+          `${config.maxLongMinutes} min) from SECTIONS. Each section = one voiceover from generate_speech (one paragraph ` +
+          'or chapter of the script, 20-120 s) + the images/clips shown in order while it plays (each picture gets an equal ' +
+          'share of that voice, best 4-10 s per picture). Pictures should be 16:9 (other shapes are placed over a blurred copy). ' +
+          'Still images get a slow zoom/pan; readable subtitles are added from the voice; an optional chapter heading shows ' +
+          'at the start of a section and an optional title on the opening seconds. Rendering runs in the background and ' +
+          'takes roughly as long as the video itself: this call waits a few minutes, then returns a job_id for get_long_video. ' +
+          'Cost: free, plus a tiny speech-recognition fee for subtitles.' +
+          (listMusic().length ? ` Music tracks: ${listMusic().map((t) => t.name).join(', ')} (or a mood prefix, e.g. "calm").` : ''),
+        inputSchema: {
+          sections: z
+            .array(
+              z.object({
+                voiceover_url: z.string().url().describe('The /media/ mp3 link from generate_speech for this part of the script'),
+                media_urls: z
+                  .array(z.string().url())
+                  .min(1)
+                  .max(30)
+                  .describe('/media/ links of the images or clips for this section, in order'),
+                heading: z.string().max(60).optional().describe('Optional chapter heading shown briefly at the start of the section'),
+              }),
+            )
+            .min(1)
+            .max(40),
+          title: z.string().max(70).optional().describe('Optional big title shown over the first seconds of the video'),
+          subtitles: z.boolean().optional().describe('Burn readable subtitles from the voiceover (default true)'),
+          language: z.string().max(5).optional().describe('ISO code of the voiceover language (e.g. az, en, tr) for better subtitles'),
+          motion: z.boolean().optional().describe('Slow zoom/pan on still images (default true)'),
+          music: z.string().max(60).optional().describe('Background music track name or mood prefix (see description); omit for none'),
+        },
+      },
+      async (args) => {
+        if (userId === 'anonymous') return fail('Long videos need a signed-in user. Ask the user to sign in again.');
+        const q = checkQuota(userId, 'long', 1);
+        if (!q.ok) return quotaError('long video', q);
+        const busy = longform.activeLongFor(userId);
+        if (busy) {
+          return fail(`A long video for this user is already being built (job_id: ${busy}). Wait for it with get_long_video before starting another.`);
+        }
+        const sections = [];
+        for (const [i, sec] of args.sections.entries()) {
+          const voiceFile = localMediaPath(sec.voiceover_url);
+          if (!voiceFile || kindOf(voiceFile) !== 'audio') {
+            return fail(`Section ${i + 1}: voiceover_url must be an audio link created by generate_speech (…/media/….mp3).`);
+          }
+          const items = [];
+          for (const u of sec.media_urls) {
+            const file = localMediaPath(u);
+            const kind = file && kindOf(file);
+            if (!file || (kind !== 'image' && kind !== 'video')) {
+              return fail(`Section ${i + 1}: use image or video links created by this server's tools (…/media/…); got ${u}`);
+            }
+            items.push({ file, kind });
+          }
+          sections.push({ voiceFile, items, heading: sec.heading });
+        }
+        let musicFile;
+        if (args.music) {
+          const t = pickMusic(args.music);
+          if (!t) {
+            const names = listMusic().map((x) => x.name);
+            return fail(names.length ? `No music track matches "${args.music}". Available: ${names.join(', ')}.` : 'No background music is installed on this server; leave music empty.');
+          }
+          musicFile = t.file;
+        }
+        let plan;
+        try {
+          plan = await longform.planLong(sections);
+        } catch (err) {
+          if (err instanceof StudioError) return fail(err.message);
+          return fail(`Could not read the voiceover files: ${err?.message || err}`);
+        }
+        consumeQuota(userId, 'long', 1);
+        const id = longform.startLong({
+          userId,
+          plan,
+          motion: args.motion ?? true,
+          subtitles: args.subtitles ?? true,
+          language: args.language,
+          musicFile,
+          title: args.title,
+          hooks: {
+            onStt(cost) {
+              const charged = cost * config.costMarkup;
+              if (charged > 0) addMediaSpend(userId, charged);
+              logUsage({ kind: 'stt', userId, model: config.sttModel, cost, charged });
+            },
+            done(job) {
+              logUsage({ kind: 'long', userId, jobId: job.id, seconds: job.seconds, sections: plan.sections.length });
+            },
+            fail() {
+              consumeQuota(userId, 'long', -1); // a failed render does not count against the daily limit
+            },
+          },
+        });
+        return longReply(await longform.waitLong(id, config.longWaitSeconds));
+      },
+    );
+
+    server.registerTool(
+      'get_long_video',
+      {
+        title: 'Get long video',
+        description: 'Check a video started with assemble_long. Waits a few minutes if it is still rendering, then returns the video.',
+        inputSchema: { job_id: z.string().describe('job_id returned by assemble_long') },
+      },
+      async ({ job_id }) => {
+        const job = longform.readLong(job_id);
+        if (!job || job.userId !== userId) return fail('Unknown job_id. Start again with assemble_long.');
+        return longReply(await longform.waitLong(job_id, config.longWaitSeconds));
+      },
+    );
+  }
+
+  // ----- Creator Studio: YouTube thumbnail -----
+  if (config.limitThumbnailsPerDay > 0) {
+    server.registerTool(
+      'make_thumbnail',
+      {
+        title: 'Make YouTube thumbnail',
+        description:
+          'Turn an image made with generate_image into a 1280x720 YouTube thumbnail (JPEG under 2 MB) with big, bold, outlined ' +
+          'text and a dark gradient behind it. Keep the text very short (2-6 words); wrap a word in *asterisks* to colour it ' +
+          'with the accent colour, e.g. "How *Rome* Fell". Generate the background first with aspect_ratio 16:9, leaving empty ' +
+          'space on the side where the text goes. Free. The user sets it as the thumbnail in YouTube Studio.',
+        inputSchema: {
+          image_url: z.string().url().describe('/media/ link of the background image from generate_image'),
+          text: z.string().min(1).max(60).describe('Thumbnail text, 2-6 words; *word* = accent colour'),
+          position: z.enum(['left', 'right', 'center', 'top', 'bottom']).optional().describe('Where the text goes (default left)'),
+          color: z.enum(Object.keys(longform.THUMB_COLORS)).optional().describe('Accent colour for *words* (default yellow)'),
+          uppercase: z.boolean().optional().describe('Write the text in capitals (default true)'),
+        },
+      },
+      async (args) => {
+        const q = checkQuota(userId, 'thumb', 1);
+        if (!q.ok) return quotaError('thumbnail', q);
+        const file = localMediaPath(args.image_url);
+        if (!file || kindOf(file) !== 'image') return fail('image_url must be an image link created by generate_image (…/media/…).');
+        let bytes;
+        try {
+          bytes = await longform.renderThumbnail({
+            file,
+            text: args.text,
+            position: args.position,
+            color: args.color,
+            uppercase: args.uppercase ?? true,
+          });
+        } catch (err) {
+          console.error('[make_thumbnail]', err);
+          return fail(`Could not make the thumbnail: ${err?.message || err}`);
+        }
+        const saved = saveMedia(bytes, 'image/jpeg');
+        consumeQuota(userId, 'thumb', 1);
+        logUsage({ kind: 'thumbnail', userId });
+        return {
+          content: [
+            text(
+              'Thumbnail ready (1280x720). It is already displayed to the user; do not repeat it as markdown.' +
+                (saved.url ? ` Download link: ${saved.url}` : ''),
+            ),
+            { type: 'image', data: bytes.toString('base64'), mimeType: 'image/jpeg' },
           ],
         };
       },
@@ -1070,6 +1277,7 @@ httpServer.requestTimeout = 0;
 httpServer.headersTimeout = 120_000;
 
 clips.recoverSources();
+longform.recoverLongs((job) => consumeQuota(job.userId, 'long', -1));
 setInterval(() => {
   clips.cleanupSources();
   const n = cleanupOldMedia();

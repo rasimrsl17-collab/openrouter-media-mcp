@@ -97,6 +97,13 @@ export const config = {
   sourceWaitSeconds: int('SOURCE_WAIT_SECONDS', 200),
   allowPrivateSourceUrls: process.env.ALLOW_PRIVATE_SOURCE_URLS === 'true', // tests only
 
+  // ---- Creator Studio: long horizontal videos (assemble_long) + thumbnails ----
+  limitLongVideosPerDay: int('LIMIT_LONG_VIDEOS_PER_DAY', 2), // 0 disables assemble_long
+  maxLongMinutes: int('MAX_LONG_MINUTES', 20),
+  longWaitSeconds: int('LONG_WAIT_SECONDS', 200), // how long one tool call waits for a render
+  longFps: int('LONG_FPS', 25),
+  limitThumbnailsPerDay: int('LIMIT_THUMBNAILS_PER_DAY', 30), // 0 disables make_thumbnail
+
   // ---- Creator Studio: publishing through Post for Me (empty key = social tools disabled) ----
   postForMeKey: process.env.POSTFORME_API_KEY || '',
   postForMeBaseUrl: (process.env.POSTFORME_BASE_URL || 'https://api.postforme.dev/v1').replace(/\/$/, ''),

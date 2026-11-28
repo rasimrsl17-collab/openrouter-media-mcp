@@ -35,6 +35,20 @@ export function saveMedia(bytes, mimeType) {
   return { fileName, url };
 }
 
+/** Moves a finished file (e.g. a long render) into MEDIA_DIR without loading it into memory. */
+export function saveMediaFile(srcPath, ext) {
+  const fileName = `${crypto.randomBytes(16).toString('hex')}.${ext}`;
+  const dest = path.join(config.mediaDir, fileName);
+  try {
+    fs.renameSync(srcPath, dest);
+  } catch {
+    fs.copyFileSync(srcPath, dest); // different filesystem (tmp vs volume)
+    fs.unlinkSync(srcPath);
+  }
+  const url = config.publicBaseUrl ? `${config.publicBaseUrl}/media/${fileName}` : undefined;
+  return { fileName, url };
+}
+
 export function cleanupOldMedia() {
   if (config.mediaTtlDays <= 0) return 0;
   const cutoff = Date.now() - config.mediaTtlDays * 86_400_000;
@@ -88,6 +102,8 @@ const LIMITS = {
   post: () => config.limitPostsPerDay,
   source_min: () => config.limitSourceMinutesPerDay,
   clip: () => config.limitClipsPerDay,
+  long: () => config.limitLongVideosPerDay,
+  thumb: () => config.limitThumbnailsPerDay,
 };
 
 /** Path of a file this server saved, from its public /media URL; null for anything else. */
