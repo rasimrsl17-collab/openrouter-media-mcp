@@ -43,7 +43,7 @@ export const config = {
   // Admin-fixed model allowlists. The first entry is the default.
   imageModels: list('ALLOWED_IMAGE_MODELS', 'google/gemini-3.1-flash-image,bytedance-seed/seedream-5-0-flash'),
   videoModels: list('ALLOWED_VIDEO_MODELS', 'google/veo-3.1-lite,google/gemini-omni-1.2-flash,bytedance/seedance-2.0-mini'),
-  ttsModels: list('ALLOWED_TTS_MODELS', 'openai/gpt-4o-mini-tts'),
+  ttsModels: list('ALLOWED_TTS_MODELS', 'elevenlabs/eleven-v4-turbo'),
   // Optional. Empty = use the first voice the model lists in the OpenRouter catalog.
   defaultTtsVoice: process.env.DEFAULT_TTS_VOICE || '',
 
