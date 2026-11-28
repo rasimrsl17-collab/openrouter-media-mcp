@@ -42,18 +42,22 @@ export const config = {
 
   // Admin-fixed model allowlists. The first entry is the default.
   imageModels: list('ALLOWED_IMAGE_MODELS', 'google/gemini-3.1-flash-image,bytedance-seed/seedream-5-0-flash'),
-  videoModels: list('ALLOWED_VIDEO_MODELS', 'google/veo-3.1-lite,bytedance/seedance-2.0-fast'),
-  ttsModels: list('ALLOWED_TTS_MODELS', 'microsoft/mai-voice-2.1'),
-  defaultTtsVoice: process.env.DEFAULT_TTS_VOICE || 'en-US-Harper:MAI-Voice-2.1',
+  videoModels: list('ALLOWED_VIDEO_MODELS', 'google/veo-3.1-lite,google/gemini-omni-1.2-flash,bytedance/seedance-2.0-mini'),
+  ttsModels: list('ALLOWED_TTS_MODELS', 'openai/gpt-4o-mini-tts'),
+  // Optional. Empty = use the first voice the model lists in the OpenRouter catalog.
+  defaultTtsVoice: process.env.DEFAULT_TTS_VOICE || '',
 
   // Per-user daily limits (UTC day). 0 disables the tool.
-  limitImagesPerDay: int('LIMIT_IMAGES_PER_DAY', 20),
-  limitVideosPerDay: int('LIMIT_VIDEOS_PER_DAY', 2),
-  limitTtsPerDay: int('LIMIT_TTS_PER_DAY', 30),
+  limitImagesPerDay: int('LIMIT_IMAGES_PER_DAY', 100),
+  limitVideosPerDay: int('LIMIT_VIDEOS_PER_DAY', 20),
+  limitTtsPerDay: int('LIMIT_TTS_PER_DAY', 200),
 
   // Cost caps.
   maxImagesPerCall: int('MAX_IMAGES_PER_CALL', 2),
-  maxVideoSeconds: int('MAX_VIDEO_SECONDS', 8),
+  maxVideoSeconds: int('MAX_VIDEO_SECONDS', 6),
+  // Cheapest by default: shortest supported duration, silent video. The user can ask for more.
+  videoDefaultDuration: process.env.VIDEO_DEFAULT_DURATION === 'longest' ? 'longest' : 'shortest',
+  videoAudioDefault: process.env.VIDEO_AUDIO_DEFAULT === 'true',
   allowedVideoResolutions: list('ALLOWED_VIDEO_RESOLUTIONS', '480p,720p'),
   maxTtsChars: int('MAX_TTS_CHARS', 3000),
 

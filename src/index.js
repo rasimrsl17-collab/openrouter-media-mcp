@@ -19,6 +19,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { config, validateConfig } from './config.js';
 import { reserve } from './budget.js';
+import { videoEstimateUsd, speechModel, ttsUsd, firstVoice } from './pricing.js';
 import * as or from './openrouter.js';
 import {
   initStorage,
@@ -342,7 +343,7 @@ function buildServer(userId) {
           if (!within.length) {
             return fail(`${m.model}'s shortest video (${Math.min(...modelDur)}s) is above this server's ${config.maxVideoSeconds}s cap.`);
           }
-          body.duration = Math.max(...within);
+          body.duration = config.videoDefaultDuration === 'longest' ? Math.max(...within) : Math.min(...within);
         }
 
         if (args.aspect_ratio) {
@@ -368,8 +369,15 @@ function buildServer(userId) {
 
         // Hold the estimated cost; once the job exists it becomes a provisional charge that is
         // corrected to the real cost on completion (or refunded if the job fails).
-        const estSeconds = body.duration ?? config.maxVideoSeconds;
-        const hold = await reserve(userId, config.estimateVideoUsdPerSecond * estSeconds);
+        if (args.generate_audio === undefined && !config.videoAudioDefault && caps?.generate_audio !== false) {
+          body.generate_audio = false; // silent video is cheaper; the user can ask for sound
+        }
+        const est = videoEstimateUsd(caps, {
+          resolution: body.resolution,
+          duration: body.duration,
+          audio: body.generate_audio ?? true,
+        });
+        const hold = await reserve(userId, est.usd);
         if (!hold.ok) return fail(hold.message);
 
         let submitted;
@@ -385,7 +393,7 @@ function buildServer(userId) {
           return fail('OpenRouter did not return a job id.');
         }
         consumeQuota(userId, 'video', 1);
-        const provisional = config.estimateVideoUsdPerSecond * estSeconds * config.costMarkup;
+        const provisional = est.usd * config.costMarkup;
         addMediaSpend(userId, provisional);
         hold.release();
         rememberJob(jobId, { userId, model: m.model, charged: provisional });
@@ -450,12 +458,14 @@ function buildServer(userId) {
         const q = checkQuota(userId, 'tts', 1);
         if (!q.ok) return quotaError('speech', q);
         // OpenRouter returns no cost for speech, so the estimate is also what gets charged.
-        const ttsCost = (args.text.length / 1000) * config.estimateTtsUsdPer1kChars;
+        const sm = await speechModel(m.model);
+        const ttsCost = ttsUsd(sm, args.text.length).usd;
         const hold = await reserve(userId, ttsCost);
         if (!hold.ok) return fail(hold.message);
         try {
 
-        const voice = args.voice || (m.model === config.ttsModels[0] ? config.defaultTtsVoice : undefined);
+        const voice =
+          args.voice || (m.model === config.ttsModels[0] && config.defaultTtsVoice) || firstVoice(sm) || undefined;
         const body = { model: m.model, input: args.text, response_format: 'mp3' };
         if (voice) body.voice = voice;
         if (args.instructions) body.instructions = args.instructions;

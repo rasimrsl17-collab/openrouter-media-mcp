@@ -59,9 +59,15 @@ app.get('/videos/models', (_req, res) =>
         supported_resolutions: ['720p', '1080p'],
         supported_aspect_ratios: ['16:9', '9:16'],
         supported_sizes: null,
-        supported_durations: [4, 6, 8],
+        supported_durations: [8, 4, 6],
         supported_frame_images: ['first_frame', 'last_frame'],
         generate_audio: true,
+        pricing_skus: {
+          duration_seconds_without_audio_720p: '0.03',
+          duration_seconds_with_audio_720p: '0.05',
+          duration_seconds_without_audio: '0.05',
+          duration_seconds_with_audio: '0.08',
+        },
       },
       {
         id: 'bytedance/seedance-2.0-fast',
@@ -99,7 +105,14 @@ app.post('/audio/speech', (req, res) => {
   res.set('X-Generation-Id', 'gen-tts-1').type('audio/mpeg').send(Buffer.from('ID3FAKEMP3'.repeat(200)));
 });
 app.get('/models', (req, res) =>
-  res.json({ data: [{ id: 'microsoft/mai-voice-2.1', name: 'MAI Voice 2.1', supported_voices: ['en-US-Harper:MAI-Voice-2.1'] }] }),
+  res.json({ data: [
+      {
+        id: 'microsoft/mai-voice-2.1',
+        name: 'MAI Voice 2.1',
+        supported_voices: ['en-US-Harper:MAI-Voice-2.1'],
+        pricing: { prompt: '0.0000006', completion: '0' },
+      },
+    ] }),
 );
 
 export function start(port) {

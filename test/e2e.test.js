@@ -37,6 +37,8 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     LIMIT_IMAGES_PER_DAY: '4',
     LIMIT_VIDEOS_PER_DAY: '2',
     VIDEO_POLL_SECONDS: '1',
+    ALLOWED_TTS_MODELS: 'microsoft/mai-voice-2.1',
+    MAX_VIDEO_SECONDS: '8',
     LITELLM_URL: `http://127.0.0.1:${LL_PORT}`,
     LITELLM_CUSTOMER_KEY: 'cust-key',
     COST_MARKUP: '1.5',
@@ -118,7 +120,7 @@ try {
 
   // 6. video: validation from /videos/models caps
   r = await client.callTool({ name: 'generate_video', arguments: { prompt: 'p', duration: 7 } });
-  assert.ok(r.isError && /supports durations 4, 6, 8/.test(r.content[0].text), JSON.stringify(r));
+  assert.ok(r.isError && /supports durations 8, 4, 6/.test(r.content[0].text), JSON.stringify(r));
   r = await client.callTool({ name: 'generate_video', arguments: { prompt: 'p', duration: 30 } });
   assert.ok(r.isError && /limit of 8s/.test(r.content[0].text));
   r = await client.callTool({ name: 'generate_video', arguments: { prompt: 'p', resolution: '1080p' } });
@@ -131,9 +133,10 @@ try {
   const vReq = seen.findLast((s) => s.path === '/videos' && s.method === 'POST');
   assert.deepEqual(
     { model: vReq.body.model, resolution: vReq.body.resolution, duration: vReq.body.duration, ar: vReq.body.aspect_ratio },
-    { model: 'google/veo-3.1-lite', resolution: '720p', duration: 8, ar: '9:16' },
+    { model: 'google/veo-3.1-lite', resolution: '720p', duration: 4, ar: '9:16' },
   );
   const res = r.content.find((c) => c.type === 'resource');
+  assert.equal(vReq.body.generate_audio, false, 'silent (cheaper) video by default');
   assert.ok(res.resource.uri.startsWith('ui://openrouter-media/video/'));
   assert.equal(res.resource.mimeType, 'text/html');
   const vUrl = res.resource.text.match(/src="([^"]+)"/)[1];
@@ -242,8 +245,8 @@ try {
   r = await vC.callTool({ name: 'generate_speech', arguments: { text: 'Salam dünya' } });
   assert.ok(!r.isError);
   const st2 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8'));
-  assert.ok(Math.abs(st2.media['user-V'] - (0.6 + (11 / 1000) * 0.03 * 1.5)) < 1e-9);
-  ok('speech charged by estimate x markup');
+  assert.ok(Math.abs(st2.media['user-V'] - (0.6 + 11 * 0.0000006 * 1.5)) < 1e-9, 'speech charged at catalog price: ' + st2.media['user-V']);
+  ok('speech charged at the catalog per-character price x markup');
 
   // raising max_budget (a purchase) immediately restores access
   customers.set('user-FREE', { spend: 0.0007, max_budget: 5, models: [] });

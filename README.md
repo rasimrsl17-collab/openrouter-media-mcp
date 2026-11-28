@@ -96,6 +96,13 @@ unset MK
 
 Açarı `.env`-də `LITELLM_CUSTOMER_KEY`, LiteLLM ünvanını `LITELLM_URL` kimi yaz.
 
+## Qiymət və ucuz defoltlar
+
+- Video qiyməti `/videos/models`-dəki `pricing_skus`-dan oxunur (saniyəyə görə), token ilə qiymətlənən modellərdə (Seedance) `ESTIMATE_VIDEO_USD_PER_SECOND` ehtiyat dəyəri işlənir. Real xərc tamamlananda OpenRouter-in `usage.cost`-undan götürülür.
+- Defolt: ən qısa müddət və səssiz video (səs əlavə ödənişlidir), istifadəçi istəsə daha uzun (`MAX_VIDEO_SECONDS`-a qədər) və ya səsli istəyə bilər.
+- Səs: OpenRouter xərc qaytarmır, ona görə qiymət `/models?output_modalities=speech` kataloqundakı simvol qiymətindən hesablanır (token ilə qiymətlənənlərdə ehtiyat `ESTIMATE_TTS_USD_PER_1K_CHARS`).
+- Gündəlik say limitləri yalnız ehtiyat tədbiridir, əsas limit istifadəçinin kreditidir.
+
 ## Test
 
 ```bash
