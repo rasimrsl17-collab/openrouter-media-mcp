@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { execFileSync } from 'node:child_process';
-import { start, seen, startLitellm, customers, litellmSeen, startZernio, zernio, zernioSeen, sttSeen } from './mock-openrouter.js';
+import { start, seen, startLitellm, customers, litellmSeen, startPostForMe, pfm, pfmSeen, sttSeen } from './mock-openrouter.js';
 
 const MOCK_PORT = 4555;
 const MCP_PORT = 3499;
@@ -17,7 +17,7 @@ const LL_PORT = 4556;
 const mock = await start(MOCK_PORT);
 const llMock = await startLitellm(LL_PORT);
 const ZN_PORT = 4557;
-const znMock = await startZernio(ZN_PORT);
+const znMock = await startPostForMe(ZN_PORT);
 // two paying users with plenty of credit, a free user, and a nearly empty one
 customers.set('user-A', { spend: 1, max_budget: 100 });
 customers.set('user-B', { spend: 0, max_budget: 100 });
@@ -47,9 +47,9 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     COST_MARKUP: '1.5',
     ESTIMATE_IMAGE_USD: '0.08',
     ESTIMATE_VIDEO_USD_PER_SECOND: '0.08',
-    ZERNIO_API_KEY: 'zn-key',
-    ZERNIO_BASE_URL: `http://127.0.0.1:${ZN_PORT}`,
-    SOCIAL_REDIRECT_URL: 'https://velorafy.example/back',
+    POSTFORME_API_KEY: 'pfm-key',
+    POSTFORME_BASE_URL: `http://127.0.0.1:${ZN_PORT}`,
+    SOCIAL_STATUS_WAIT_MS: '10',
     SOCIAL_POST_FEE_USD: '0.02',
     LIMIT_SHORTS_PER_DAY: '4',
     MAX_SHORT_SECONDS: '30',
@@ -92,7 +92,7 @@ try {
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
     'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_video_transcript', 'list_media_models',
-    'social_connect_account', 'social_list_accounts', 'social_publish', 'transcribe_video',
+    'social_connect_account', 'social_list_accounts', 'social_post_status', 'social_publish', 'transcribe_video',
   ]);
   ok('tools listed: ' + tools.join(', '));
 
@@ -390,42 +390,49 @@ try {
   assert.ok(r.isError && /video-minutes limit/.test(r.content[0].text), JSON.stringify(r));
   ok('cut_clips -> vertical 1080x1920 clips (fit framing, title, word captions); daily clip + minutes limits enforced');
 
-  // ---- social publishing ----
-  r = await sC.callTool({ name: 'social_connect_account', arguments: { platform: 'youtube' } });
+  // ---- social publishing (Post for Me) ----
+  r = await sC.callTool({ name: 'social_connect_account', arguments: { platform: 'instagram' } });
   assert.ok(!r.isError, JSON.stringify(r));
-  assert.ok(r.content[0].text.includes('https://auth.example/youtube?p=prof_1'));
-  const conn = zernioSeen.findLast((x) => x.path.startsWith('/connect/'));
-  assert.equal(conn.query.redirect_url, 'https://velorafy.example/back');
-  assert.equal(zernio.profiles[0].externalId, 'user-S');
-  ok('social_connect_account creates one profile per user (externalId) and returns the OAuth link');
+  assert.ok(r.content[0].text.includes('https://auth.example/instagram?ext=lc_user-S'));
+  const conn = pfmSeen.findLast((x) => x.path === '/social-accounts/auth-url').body;
+  assert.equal(conn.external_id, 'lc_user-S');
+  assert.deepEqual(conn.platform_data, { instagram: { connection_type: 'instagram' } });
+  r = await sC.callTool({ name: 'social_connect_account', arguments: { platform: 'linkedin' } });
+  assert.deepEqual(pfmSeen.findLast((x) => x.path === '/social-accounts/auth-url').body.platform_data, { linkedin: { connection_type: 'organization' } });
+  ok('social_connect_account: OAuth link tagged with the user (external_id), Instagram/LinkedIn quickstart options');
 
-  // the user finishes OAuth: accounts appear in their profile; another user owns a different account
-  zernio.accounts.push({ _id: 'acc_yt_S', platform: 'youtube', username: 'spacefacts', isActive: true, profileId: 'prof_1' });
-  zernio.accounts.push({ _id: 'acc_tt_S', platform: 'tiktok', username: 'spacefacts', isActive: true, profileId: 'prof_1' });
+  // the user finishes OAuth: accounts appear tagged with their external_id; another user owns a different account
+  pfm.accounts.push({ id: 'spc_yt_S', platform: 'youtube', username: 'spacefacts', status: 'connected', external_id: 'lc_user-S' });
+  pfm.accounts.push({ id: 'spc_tt_S', platform: 'tiktok', username: 'spacefacts', status: 'connected', external_id: 'lc_user-S' });
+  pfm.accounts.push({ id: 'spc_ig_S', platform: 'instagram', username: 'spacefacts', status: 'disconnected', external_id: 'lc_user-S' });
   const oC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-O' });
   r = await oC.callTool({ name: 'social_list_accounts', arguments: {} });
   assert.ok(/No accounts connected/.test(r.content[0].text));
-  zernio.accounts.push({ _id: 'acc_yt_O', platform: 'youtube', username: 'other', isActive: true, profileId: 'prof_2' });
+  pfm.accounts.push({ id: 'spc_yt_O', platform: 'youtube', username: 'other', status: 'connected', external_id: 'lc_user-O' });
 
   r = await sC.callTool({ name: 'social_list_accounts', arguments: {} });
+  assert.ok(!r.content[0].text.includes('SECRET-TOKEN'), 'OAuth tokens never reach the model');
   const accs = JSON.parse(r.content[0].text);
-  assert.deepEqual(accs.map((a) => a.account_id).sort(), ['acc_tt_S', 'acc_yt_S']);
-  const profileCalls = zernioSeen.filter((x) => x.method === 'POST' && x.path === '/profiles').length;
-  assert.equal(profileCalls, 2, 'profile is created once per user and then cached');
-  ok("social_list_accounts shows only the user's own accounts");
+  assert.deepEqual(accs.map((a) => a.account_id).sort(), ['spc_ig_S', 'spc_tt_S', 'spc_yt_S']);
+  ok("social_list_accounts shows only the user's own accounts, without tokens");
 
   r = await sC.callTool({
     name: 'social_publish',
-    arguments: { media_urls: [shortUrl], caption: 'x', targets: [{ account_id: 'acc_yt_O' }], mode: 'now' },
+    arguments: { media_urls: [shortUrl], caption: 'x', targets: [{ account_id: 'spc_yt_O' }], mode: 'now' },
   });
-  assert.ok(r.isError && /not connected to this user/.test(r.content[0].text));
+  assert.ok(r.isError && /not one of this user's connected accounts/.test(r.content[0].text), JSON.stringify(r));
   r = await sC.callTool({
     name: 'social_publish',
-    arguments: { media_urls: ['https://evil.example/a.mp4'], caption: 'x', targets: [{ account_id: 'acc_yt_S' }], mode: 'now' },
+    arguments: { media_urls: [shortUrl], caption: 'x', targets: [{ account_id: 'spc_ig_S' }], mode: 'now' },
+  });
+  assert.ok(r.isError && /disconnected/.test(r.content[0].text));
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: ['https://evil.example/a.mp4'], caption: 'x', targets: [{ account_id: 'spc_yt_S' }], mode: 'now' },
   });
   assert.ok(r.isError && /Only media created by this server/.test(r.content[0].text));
-  assert.ok(!zernioSeen.some((x) => x.path === '/posts'), 'nothing was posted');
-  ok("social_publish refuses another user's account and foreign media before calling Zernio");
+  assert.ok(!pfmSeen.some((x) => x.path === '/social-posts' && x.method === 'POST'), 'nothing was posted');
+  ok("social_publish refuses other users' accounts, disconnected accounts and foreign media before posting");
 
   const spendBefore = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
   r = await sC.callTool({
@@ -433,47 +440,65 @@ try {
     arguments: {
       media_urls: [shortUrl],
       caption: '3 space secrets\n#space #shorts',
-      targets: [{ account_id: 'acc_yt_S', youtube_title: '3 Space Secrets' }, { account_id: 'acc_tt_S' }],
+      targets: [{ account_id: 'spc_yt_S', title: '3 Space Secrets' }, { account_id: 'spc_tt_S' }],
       mode: 'now',
     },
   });
   assert.ok(!r.isError, JSON.stringify(r));
-  const posted = zernioSeen.findLast((x) => x.path === '/posts');
-  assert.equal(posted.body.publishNow, true);
-  assert.equal(posted.body.profileId, 'prof_1');
-  assert.deepEqual(posted.body.mediaItems, [{ url: shortUrl }]);
-  assert.deepEqual(posted.body.platforms, [
-    { platform: 'youtube', accountId: 'acc_yt_S', platformSpecificData: { title: '3 Space Secrets' } },
-    { platform: 'tiktok', accountId: 'acc_tt_S' },
+  const posted = pfmSeen.findLast((x) => x.path === '/social-posts' && x.method === 'POST').body;
+  assert.deepEqual(posted.social_accounts, ['spc_yt_S', 'spc_tt_S']);
+  assert.deepEqual(posted.media, [{ url: shortUrl }]);
+  assert.equal(posted.scheduled_at, undefined);
+  assert.deepEqual(posted.account_configurations, [
+    { social_account_id: 'spc_yt_S', configuration: { title: '3 Space Secrets', privacy_status: 'public', made_for_kids: false, contains_synthetic_media: true } },
+    { social_account_id: 'spc_tt_S', configuration: { privacy_status: 'public', is_ai_generated: true, disclose_your_brand: false, disclose_branded_content: false } },
   ]);
-  assert.ok(posted.idem && posted.idem.length >= 32, 'Idempotency-Key sent');
+  assert.ok(/youtube @spacefacts: published https:\/\/youtube.example\/v\/1/.test(r.content[0].text), r.content[0].text);
+  assert.ok(/tiktok @spacefacts: FAILED \(Video must be under 60 seconds\)/.test(r.content[0].text));
+  const postId = r.content[0].text.match(/post_id: (sp_\d+)/)[1];
   const spendAfter = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
   assert.ok(Math.abs(spendAfter - spendBefore - 0.02 * 2 * 1.5) < 1e-9, 'fee 0.02 x 2 accounts x markup 1.5');
-  ok('social_publish now: correct Zernio body (platform from account, YouTube title, idempotency) + per-account fee charged');
+  ok('social_publish now: AI labels on YouTube/TikTok, titles, per-platform results with links + per-account fee charged');
+
+  r = await sC.callTool({ name: 'social_post_status', arguments: { post_id: postId } });
+  assert.ok(!r.isError && /published https:\/\/youtube.example/.test(r.content[0].text));
+  r = await oC.callTool({ name: 'social_post_status', arguments: { post_id: postId } });
+  assert.ok(r.isError && /Unknown post_id/.test(r.content[0].text));
+  ok("social_post_status shows results; other users cannot read someone else's post");
 
   r = await sC.callTool({
     name: 'social_publish',
-    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'acc_tt_S' }], mode: 'schedule' },
+    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'spc_tt_S' }], mode: 'schedule' },
   });
   assert.ok(r.isError && /scheduled_for is required/.test(r.content[0].text));
+  const y = new Date().getUTCFullYear() + 1;
   r = await sC.callTool({
     name: 'social_publish',
-    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'acc_tt_S' }], mode: 'schedule', scheduled_for: '2026-12-01T18:00:00', timezone: 'America/New_York' },
+    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'spc_tt_S' }], mode: 'schedule', scheduled_for: `${y}-07-01T18:00:00`, timezone: 'America/New_York' },
   });
-  assert.ok(!r.isError);
-  const sched = zernioSeen.findLast((x) => x.path === '/posts').body;
-  assert.deepEqual([sched.scheduledFor, sched.timezone, sched.publishNow], ['2026-12-01T18:00:00', 'America/New_York', undefined]);
-  ok('social_publish schedule passes scheduledFor + timezone');
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.equal(pfmSeen.findLast((x) => x.path === '/social-posts' && x.method === 'POST').body.scheduled_at, `${y}-07-01T22:00:00.000Z`);
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'spc_tt_S' }], mode: 'schedule', scheduled_for: `${y}-01-15T09:30:00`, timezone: 'Asia/Baku' },
+  });
+  assert.equal(pfmSeen.findLast((x) => x.path === '/social-posts' && x.method === 'POST').body.scheduled_at, `${y}-01-15T05:30:00.000Z`);
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'past', targets: [{ account_id: 'spc_tt_S' }], mode: 'schedule', scheduled_for: '2020-01-01T10:00:00Z' },
+  });
+  assert.ok(r.isError && /future/.test(r.content[0].text));
+  ok('social_publish schedule converts local time + timezone to UTC (DST-aware), refuses past times');
 
   const s1 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
   r = await sC.callTool({
     name: 'social_publish',
-    arguments: { media_urls: [shortUrl], caption: 'FAILALL', targets: [{ account_id: 'acc_tt_S' }], mode: 'now' },
+    arguments: { media_urls: [shortUrl], caption: 'INVALID', targets: [{ account_id: 'spc_tt_S' }], mode: 'now' },
   });
-  assert.ok(r.isError && /FAILED/.test(r.content[0].text) && /too long/.test(r.content[0].text));
+  assert.ok(r.isError && /video is too long/.test(r.content[0].text), JSON.stringify(r));
   const s2 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
-  assert.equal(s2, s1, 'a fully failed post is not charged');
-  ok('HTTP 207 total failure is reported as an error and not charged');
+  assert.equal(s2, s1, 'a rejected post is not charged');
+  ok('a post rejected by Post for Me is reported with its reason and not charged');
 
   const anonC = await connect({ 'x-api-key': 'sekret' });
   r = await anonC.callTool({ name: 'social_list_accounts', arguments: {} });

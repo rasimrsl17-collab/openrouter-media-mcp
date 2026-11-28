@@ -97,13 +97,15 @@ export const config = {
   sourceWaitSeconds: int('SOURCE_WAIT_SECONDS', 200),
   allowPrivateSourceUrls: process.env.ALLOW_PRIVATE_SOURCE_URLS === 'true', // tests only
 
-  // ---- Creator Studio: publishing through Zernio (empty key = social tools disabled) ----
-  zernioKey: process.env.ZERNIO_API_KEY || '',
-  zernioBaseUrl: (process.env.ZERNIO_BASE_URL || 'https://zernio.com/api/v1').replace(/\/$/, ''),
-  socialRedirectUrl: process.env.SOCIAL_REDIRECT_URL || '', // where users land after connecting an account
-  socialPlatforms: list('SOCIAL_PLATFORMS', 'youtube,tiktok,instagram,facebook,linkedin,pinterest,threads'),
+  // ---- Creator Studio: publishing through Post for Me (empty key = social tools disabled) ----
+  postForMeKey: process.env.POSTFORME_API_KEY || '',
+  postForMeBaseUrl: (process.env.POSTFORME_BASE_URL || 'https://api.postforme.dev/v1').replace(/\/$/, ''),
+  // Post for Me platform ids. Bluesky is left out on purpose: it needs an app password, not an OAuth link.
+  socialPlatforms: list('SOCIAL_PLATFORMS', 'youtube,tiktok,instagram,facebook,x,linkedin,threads,pinterest'),
   limitPostsPerDay: int('LIMIT_POSTS_PER_DAY', 10),
-  socialPostFeeUsd: num('SOCIAL_POST_FEE_USD', 0), // charged per published post (pass your Zernio cost on)
+  // Charged per account a post goes to (Post for Me bills $10 per 1,000 successful account-posts).
+  socialPostFeeUsd: num('SOCIAL_POST_FEE_USD', 0),
+  socialStatusWaitMs: int('SOCIAL_STATUS_WAIT_MS', 8000),
 
   // LibreChat rejects MCP images above 10 MB (MCP_IMAGE_DATA_MAX_BYTES); stay safely below.
   previewMaxBytes: int('PREVIEW_MAX_BYTES', 8 * 1024 * 1024),

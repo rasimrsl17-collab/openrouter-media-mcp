@@ -69,7 +69,6 @@ function load() {
   state.usage ??= {}; // { "2026-11-26": { "<userId>": { image: 3, video: 1, tts: 0 } } }
   state.media ??= {}; // { "<userId>": total USD this server charged for media (never reset) }
   state.jobs ??= {}; // { "<jobId>": { userId, model, createdAt, fileName?, url? } }
-  state.social ??= {}; // { "<userId>": "<Zernio profile _id>" }
   return state;
 }
 
@@ -100,16 +99,6 @@ export function localMediaPath(url) {
   if (!/^[a-f0-9]{32}\.[a-z0-9]{2,4}$/.test(name)) return null;
   const p = path.join(config.mediaDir, name);
   return fs.existsSync(p) ? p : null;
-}
-
-export function getSocialProfile(userId) {
-  return load().social[userId];
-}
-
-export function setSocialProfile(userId, profileId) {
-  const s = load();
-  s.social[userId] = profileId;
-  save();
 }
 
 /** Returns { ok, used, limit }. Does not consume. */

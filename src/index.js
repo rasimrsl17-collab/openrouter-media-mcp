@@ -784,13 +784,20 @@ function buildServer(userId) {
     );
   }
 
-  // ----- Creator Studio: social publishing (Zernio) -----
-  if (config.zernioKey && config.limitPostsPerDay > 0) {
+  // ----- Creator Studio: social publishing (Post for Me) -----
+  if (config.postForMeKey && config.limitPostsPerDay > 0) {
     const anon = () => fail('Publishing needs a signed-in user. Ask the user to sign in again.');
     const socialFail = (err) => {
-      if (err instanceof social.SocialError) return fail(`Publishing service error${err.status ? ` (HTTP ${err.status})` : ''}: ${err.message}`);
+      if (err instanceof social.SocialError) return fail(`Publishing error${err.status ? ` (HTTP ${err.status})` : ''}: ${err.message}`);
       console.error('[social]', err);
       return fail(`Unexpected publishing error: ${err?.message || err}`);
+    };
+    const describeResults = (st) => {
+      const lines = st.results.map((r) =>
+        r.success ? `- ${r.platform} @${r.username}: published ${r.url || ''}`.trim() : `- ${r.platform} @${r.username}: FAILED (${r.error})`,
+      );
+      if (st.pending) lines.push(`- ${st.pending} account(s) still processing (video uploads can take a few minutes)`);
+      return lines.join('\n');
     };
 
     if (config.socialPlatforms.length) server.registerTool(
@@ -798,16 +805,17 @@ function buildServer(userId) {
       {
         title: 'Connect a social account',
         description:
-          "Get a secure link where the user connects their OWN social media account (they log in on the platform's site; " +
-          `we never see their password). Platforms: ${config.socialPlatforms.join(', ')}. Give the link to the user and ` +
-          'ask them to tell you when they are done, then call social_list_accounts.',
+          "Get a secure link where the user connects their OWN social media account (they log in on the platform's own site; " +
+          `we never see their password). Platforms: ${config.socialPlatforms.join(', ')}. The login screen shows "Post for Me", ` +
+          'our publishing partner — tell the user that is expected. Instagram must be a Business or Creator account. ' +
+          'Give the link to the user and ask them to tell you when they are done, then call social_list_accounts.',
         inputSchema: { platform: z.enum(config.socialPlatforms) },
       },
       async ({ platform }) => {
         if (userId === 'anonymous') return anon();
         try {
           const url = await social.connectUrl(userId, platform);
-          return { content: [text(`Give the user this link to connect their ${platform} account (valid for a limited time): ${url}`)] };
+          return { content: [text(`Give the user this link to connect their ${platform} account (it expires after a while): ${url}`)] };
         } catch (err) {
           return socialFail(err);
         }
@@ -842,23 +850,28 @@ function buildServer(userId) {
         description:
           "Publish, schedule or save as draft a video/images to the user's connected accounts. ONLY call this after the user " +
           'has seen the final video and caption and explicitly said yes to posting them to the named accounts. ' +
-          'Media must be links created by this server (e.g. the assemble_short result).' +
-          (config.socialPostFeeUsd > 0 ? ` Costs $${config.socialPostFeeUsd} credit per published post.` : ''),
+          'Media must be links created by this server (e.g. the assemble_short or cut_clips result). ' +
+          'Videos made with AI images/voices are labelled as AI-generated on TikTok, YouTube and X (keep ai_generated true for them; ' +
+          "set it false only for clips of the user's own real footage). Uploads finish in the background: check with social_post_status." +
+          (config.socialPostFeeUsd > 0 ? ` Costs $${(config.socialPostFeeUsd * config.costMarkup).toFixed(3)} credit per account posted to.` : ''),
         inputSchema: {
-          media_urls: z.array(z.string().url()).min(1).max(10).describe('Usually one: the assemble_short video link'),
-          caption: z.string().min(1).max(2200).describe('Post text with hashtags; first line is used as the YouTube title if none given'),
+          media_urls: z.array(z.string().url()).min(1).max(10).describe('Usually one: the video link'),
+          caption: z.string().min(1).max(2200).describe('Post text with hashtags (also the YouTube description)'),
           targets: z
             .array(
               z.object({
                 account_id: z.string().min(1).describe('From social_list_accounts'),
-                youtube_title: z.string().max(100).optional(),
+                title: z.string().max(100).optional().describe('YouTube / TikTok / Pinterest title (YouTube needs one; keep it under 70 chars)'),
+                privacy: z.enum(['public', 'private', 'unlisted', 'followers', 'friends']).optional().describe('Default public'),
+                tiktok_draft: z.boolean().optional().describe('TikTok only: send to the TikTok app inbox so the user finishes posting there'),
               }),
             )
             .min(1)
             .max(10),
           mode: z.enum(['now', 'schedule', 'draft']).describe('now = publish immediately; schedule = at scheduled_for; draft = save only'),
-          scheduled_for: z.string().optional().describe('ISO 8601 time, required for mode=schedule, e.g. 2026-12-01T18:00:00'),
-          timezone: z.string().optional().describe('IANA zone for scheduled_for without offset, e.g. America/New_York'),
+          scheduled_for: z.string().optional().describe('Required for schedule, e.g. 2026-12-01T18:00:00'),
+          timezone: z.string().optional().describe("IANA zone of scheduled_for, e.g. America/New_York (ask the user's time zone)"),
+          ai_generated: z.boolean().optional().describe('Default true'),
         },
       },
       async (args) => {
@@ -880,32 +893,58 @@ function buildServer(userId) {
             mode: args.mode,
             scheduledFor: args.scheduled_for,
             timezone: args.timezone,
+            aiGenerated: args.ai_generated,
           });
-          const failed = r.httpStatus === 207 && r.status === 'failed';
-          if (!failed) {
-            consumeQuota(userId, 'post', 1);
-            if (fee > 0) addMediaSpend(userId, fee * config.costMarkup);
+          consumeQuota(userId, 'post', 1);
+          const charged = fee * config.costMarkup;
+          if (charged > 0) addMediaSpend(userId, charged);
+          logUsage({ kind: 'post', userId, mode: args.mode, postId: r.postId, status: r.status, targets: args.targets.length, charged });
+
+          let extra = '';
+          if (args.mode === 'now') {
+            // most text/image posts finish within seconds; videos keep uploading in the background
+            await new Promise((res) => setTimeout(res, config.socialStatusWaitMs));
+            try {
+              extra = '\n' + describeResults(await social.postStatus(userId, r.postId));
+            } catch {
+              /* status is optional here */
+            }
           }
-          logUsage({ kind: 'post', userId, mode: args.mode, postId: r.postId, status: r.status, targets: args.targets.length, charged: failed ? 0 : fee * config.costMarkup });
-          const summary = { post_id: r.postId, status: r.status, platforms: r.platforms, error: r.error, warnings: r.warnings };
+          const head =
+            args.mode === 'schedule'
+              ? `Scheduled for ${r.scheduledAt} (UTC) on ${r.accounts.map((a) => a.platform).join(', ')}.`
+              : args.mode === 'draft'
+                ? 'Saved as a draft (not published).'
+                : `Sent for publishing to ${r.accounts.map((a) => a.platform).join(', ')}.`;
           return {
-            ...(failed ? { isError: true } : {}),
             content: [
-              text(
-                (failed
-                  ? 'Publishing FAILED on every platform. Explain the error to the user in simple words.'
-                  : r.httpStatus === 207
-                    ? 'Published on some platforms only. Tell the user which ones failed and why.'
-                    : `Done (${args.mode}).`) +
-                  '\n' +
-                  JSON.stringify(summary, null, 1).slice(0, 4000),
-              ),
+              text(`${head} post_id: ${r.postId}${extra}\nUse social_post_status with this post_id to see the final result and links.`),
             ],
           };
         } catch (err) {
           return socialFail(err);
         } finally {
           hold.release();
+        }
+      },
+    );
+
+    server.registerTool(
+      'social_post_status',
+      {
+        title: 'Check a post',
+        description: 'See where a post from social_publish was published, with links, or why it failed on a platform.',
+        inputSchema: { post_id: z.string().min(1) },
+      },
+      async ({ post_id }) => {
+        if (userId === 'anonymous') return anon();
+        try {
+          const st = await social.postStatus(userId, post_id);
+          const head =
+            st.status === 'scheduled' ? `Scheduled for ${st.scheduledAt} (UTC), not published yet.` : st.status === 'draft' ? 'Draft (not published).' : `Status: ${st.status}.`;
+          return { content: [text(`${head}\n${describeResults(st)}`.trim())] };
+        } catch (err) {
+          return socialFail(err);
         }
       },
     );

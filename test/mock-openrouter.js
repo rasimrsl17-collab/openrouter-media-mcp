@@ -150,36 +150,55 @@ export function startLitellm(port) {
   });
 }
 
-// ---- Mock of Zernio's multi-tenant API (shapes from docs.zernio.com/multi-tenant and /posts/create-post) ----
-export const zernioSeen = [];
-export const zernio = { profiles: [], accounts: [], posts: [] };
-const zn = express();
-zn.use(express.json());
-zn.use((req, res, next) => {
-  zernioSeen.push({ method: req.method, path: req.path, query: req.query, body: req.body, idem: req.get('idempotency-key') });
-  if (req.get('authorization') !== 'Bearer zn-key') return res.status(401).json({ error: 'unauthorized' });
+// ---- Mock of Post for Me's API (shapes read from github.com/DayMoonDevelopment/post-for-me, api/src) ----
+export const pfmSeen = [];
+export const pfm = { accounts: [], posts: [], results: [] };
+const pf = express();
+pf.use(express.json());
+pf.use((req, res, next) => {
+  pfmSeen.push({ method: req.method, path: req.path, query: req.query, body: req.body });
+  if (req.get('authorization') !== 'Bearer pfm-key') return res.status(401).json({ message: 'Unauthorized' });
   next();
 });
-zn.get('/profiles', (req, res) => res.json({ profiles: zernio.profiles.filter((p) => p.externalId === req.query.externalId) }));
-zn.post('/profiles', (req, res) => {
-  const profile = { _id: `prof_${zernio.profiles.length + 1}`, name: req.body.name, externalId: req.body.externalId };
-  zernio.profiles.push(profile);
-  res.status(201).json({ profile });
-});
-zn.get('/connect/:platform', (req, res) =>
-  res.json({ authUrl: `https://auth.example/${req.params.platform}?p=${req.query.profileId}`, state: 's' }),
+const arr = (v) => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
+pf.post('/social-accounts/auth-url', (req, res) =>
+  res.json({ url: `https://auth.example/${req.body.platform}?ext=${req.body.external_id}`, platform: req.body.platform }),
 );
-zn.get('/accounts', (req, res) => res.json({ accounts: zernio.accounts.filter((a) => a.profileId === req.query.profileId) }));
-zn.post('/posts', (req, res) => {
-  if (req.body.content.includes('FAILALL')) {
-    return res.status(207).json({ post: { _id: 'post_x', status: 'failed', platforms: [] }, error: 'video too long for tiktok' });
-  }
-  const post = { _id: `post_${zernio.posts.length + 1}`, status: req.body.isDraft ? 'draft' : req.body.publishNow ? 'published' : 'scheduled', platforms: req.body.platforms };
-  zernio.posts.push({ ...post, body: req.body });
-  res.status(201).json({ message: 'ok', post });
+pf.get('/social-accounts', (req, res) => {
+  const ext = arr(req.query.external_id);
+  const data = pfm.accounts.filter((a) => !ext.length || ext.includes(a.external_id));
+  res.json({ data: data.map((a) => ({ ...a, access_token: 'SECRET-TOKEN' })), meta: { total: data.length, offset: 0, limit: 100, next: null } });
 });
-export function startZernio(port) {
+pf.post('/social-posts', (req, res) => {
+  const b = req.body;
+  if (b.caption.includes('INVALID')) return res.status(400).json({ message: 'Invalid Request', errors: ['TikTok: video is too long'] });
+  const accounts = b.social_accounts.map((id) => pfm.accounts.find((a) => a.id === id)).filter(Boolean);
+  const post = { id: `sp_${pfm.posts.length + 1}`, caption: b.caption, status: b.isDraft ? 'draft' : b.scheduled_at ? 'scheduled' : 'processing', scheduled_at: b.scheduled_at ?? null, social_accounts: accounts, body: b };
+  pfm.posts.push(post);
+  if (post.status === 'processing') {
+    accounts.forEach((a, i) =>
+      pfm.results.push(
+        i === 0
+          ? { id: `r${pfm.results.length}`, post_id: post.id, social_account_id: a.id, success: true, error: null, platform_data: { id: 'x1', url: `https://${a.platform}.example/v/1` } }
+          : { id: `r${pfm.results.length}`, post_id: post.id, social_account_id: a.id, success: false, error: 'Video must be under 60 seconds', platform_data: null },
+      ),
+    );
+  }
+  const { body, ...out } = post;
+  res.status(201).json(out);
+});
+pf.get('/social-posts/:id', (req, res) => {
+  const p = pfm.posts.find((x) => x.id === req.params.id);
+  if (!p) return res.status(404).json({ message: 'Not found' });
+  const { body, ...out } = p;
+  res.json(out);
+});
+pf.get('/social-post-results', (req, res) => {
+  const ids = arr(req.query.post_id);
+  res.json({ data: pfm.results.filter((r) => ids.includes(r.post_id)), meta: {} });
+});
+export function startPostForMe(port) {
   return new Promise((r) => {
-    const s = zn.listen(port, () => r(s));
+    const s = pf.listen(port, () => r(s));
   });
 }

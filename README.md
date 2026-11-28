@@ -38,7 +38,7 @@ LibreChat agentlərinə alət kimi verən MCP server.
 | `transcribe_video` | Uzun videonu linkdən yükləyib zaman damğalı mətnə çevirir |
 | `get_video_transcript` | Emal davam edirsə nəticəni gözləyib qaytarır |
 | `cut_clips` | Uzun videodan seçilmiş anları altyazılı vertikal kliplərə çevirir |
-| `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Zernio OAuth) |
+| `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Post for Me OAuth) |
 | `social_list_accounts` | İstifadəçinin YALNIZ öz qoşulmuş hesabları |
 | `social_publish` | İndi paylaş / vaxta planla / qaralama — yalnız öz hesablarına, yalnız bu serverin yaratdığı media |
 
@@ -110,18 +110,21 @@ Agentin təlimatı: [`deploy/creator-agent-prompt.md`](deploy/creator-agent-prom
 - Yüklənən videolar `/data/state/sources`-da `SOURCE_TTL_HOURS` (48) saat qalıb silinir — diskə diqqət:
   90 dəqiqəlik video 1–1.5 GB ola bilər.
 
-**Paylaşım (Zernio, multi-tenant)**
-1. zernio.com-da qeydiyyat → API açarı (`sk_...`) → `.env`-də `ZERNIO_API_KEY`.
-2. Hər LibreChat istifadəçisi üçün avtomatik ayrıca Zernio profili yaradılır (`externalId` = istifadəçi id).
-3. İstifadəçi hesabını Zernio-nun OAuth linki ilə özü qoşur — parolunu biz görmürük.
-4. Zernio `/v1/posts` iş sahəsindəki İSTƏNİLƏN hesabı qəbul edir; ona görə server hər paylaşımdan
-   əvvəl hər `account_id`-nin bu istifadəçinin profilinə aid olduğunu yoxlayır.
-5. `SOCIAL_POST_FEE_USD` — Zernio xərcini müştəriyə ötürmək üçün hər hesaba hər paylaşımda tutulan
-   məbləğ (× `COST_MARKUP`). Tam uğursuz paylaşım (HTTP 207, status `failed`) pulsuzdur.
-
-**Diqqət:** Zernio-nun pulsuz planı 2 sosial hesabla məhdudlaşır (bütün istifadəçilər birlikdə) —
-real müştərilər gələndə hesab başına ödənişli plana keçmək lazımdır. `SOCIAL_PLATFORMS`-ə yeni
-platforma əlavə etməzdən əvvəl Zernio sənədində onun dəqiq id-sini yoxla.
+**Paylaşım (Post for Me, multi-tenant)**
+1. app.postforme.dev-də qeydiyyat → Quickstart layihə → API açarı → `.env`-də `POSTFORME_API_KEY`.
+   Quickstart = Post for Me-nin artıq təsdiqlənmiş TikTok/YouTube/Meta tətbiqləri, öz təsdiqin lazım deyil.
+2. Post for Me panelində layihənin **Redirect URL**-ni öz saytına qoy (məs. `https://velorafy.com/c/new`) —
+   istifadəçi hesabını qoşandan sonra ora qayıdır. Quickstart-da bunu koddan dəyişmək olmur.
+3. İstifadəçi hesabını OAuth linki ilə özü qoşur (ekranda "Post for Me" yazır); hesab
+   `external_id=lc_<LibreChat user id>` ilə işarələnir. Server hər paylaşımdan əvvəl hesabın bu istifadəçiyə
+   aid olduğunu yoxlayır (Post for Me layihədəki istənilən hesabı qəbul edir). OAuth token-ləri modelə getmir.
+4. AI ilə hazırlanmış videolar TikTok (`is_ai_generated`), YouTube (`contains_synthetic_media`) və X
+   (`made_with_ai`) üçün avtomatik AI kimi işarələnir. İstifadəçinin öz real çəkilişindən kəsilən kliplər üçün
+   agent `ai_generated: false` göndərir.
+5. Video yükləmələri arxa planda bitir: `social_post_status` hər platformanın nəticəsini və linkini göstərir.
+6. Qiymət: Post for Me $10 / 1,000 uğurlu paylaşım (hər hesab ayrıca sayılır). `SOCIAL_POST_FEE_USD` bunu
+   müştəriyə ötürür (hər hesaba, × `COST_MARKUP`). Rədd edilən paylaşımdan pul tutulmur.
+7. Instagram yalnız Business/Creator hesabları ilə işləyir. Bluesky siyahıda yoxdur (OAuth deyil, app parol tələb edir).
 
 ## Kredit yoxlaması (LiteLLM limiti ilə)
 

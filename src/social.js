@@ -1,13 +1,12 @@
-// Publishing through Zernio (zernio.com), multi-tenant:
-//   one Zernio profile per LibreChat user (externalId = LibreChat user id),
-//   the user connects their own social accounts through Zernio's OAuth link,
-//   and posts may only target accounts inside that user's own profile.
-// Zernio's /v1/posts accepts ANY accountId in the workspace, so the ownership
-// check below is what keeps users from posting to each other's channels.
+// Publishing through Post for Me (postforme.dev), multi-tenant:
+//   every LibreChat user's social accounts are tagged with external_id = "lc_<userId>" when they connect
+//   them through Post for Me's OAuth link (Quickstart project = Post for Me's pre-approved platform apps),
+//   and a post may only target accounts carrying that user's tag.
+// Post for Me's /social-posts accepts ANY account id in the project, so the ownership check below is what
+// keeps users from posting to each other's channels. Account objects also contain OAuth tokens: they are
+// never passed through to the model.
 
-import crypto from 'node:crypto';
 import { config } from './config.js';
-import { getSocialProfile, setSocialProfile } from './storage.js';
 
 export class SocialError extends Error {
   constructor(message, status) {
@@ -16,111 +15,185 @@ export class SocialError extends Error {
   }
 }
 
-async function call(method, pathAndQuery, body, extraHeaders = {}) {
+const tag = (userId) => `lc_${userId}`;
+
+async function call(method, pathAndQuery, body) {
   let res;
   try {
-    res = await fetch(`${config.zernioBaseUrl}${pathAndQuery}`, {
+    res = await fetch(`${config.postForMeBaseUrl}${pathAndQuery}`, {
       method,
       headers: {
-        Authorization: `Bearer ${config.zernioKey}`,
+        Authorization: `Bearer ${config.postForMeKey}`,
         ...(body ? { 'Content-Type': 'application/json' } : {}),
-        ...extraHeaders,
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(120_000), // publishNow uploads the video synchronously
+      signal: AbortSignal.timeout(60_000),
     });
   } catch (err) {
-    throw new SocialError(`Publishing service unreachable: ${err?.message || err}`);
+    throw new SocialError(`Publishing service unreachable: ${err.message}`);
   }
   const raw = await res.text();
-  let json;
+  let data = null;
   try {
-    json = raw ? JSON.parse(raw) : {};
+    data = raw ? JSON.parse(raw) : null;
   } catch {
-    json = { raw: raw.slice(0, 500) };
+    /* not JSON */
   }
   if (!res.ok) {
-    const msg = json?.error?.message || json?.message || json?.error || raw.slice(0, 300) || `HTTP ${res.status}`;
-    throw new SocialError(typeof msg === 'string' ? msg : JSON.stringify(msg), res.status);
+    let msg = data?.message || data?.error || raw.slice(0, 300) || `HTTP ${res.status}`;
+    if (Array.isArray(msg)) msg = msg.join('; ');
+    if (Array.isArray(data?.errors) && data.errors.length) msg += ': ' + data.errors.map((e) => (typeof e === 'string' ? e : JSON.stringify(e))).join('; ');
+    throw new SocialError(String(msg).slice(0, 600), res.status);
   }
-  return { status: res.status, json };
+  return data;
 }
 
-const idOf = (p) => p?._id || p?.id || p?.profileId;
-
-/** Returns this user's Zernio profile id, creating the profile on first use. */
-export async function ensureProfile(userId) {
-  const known = getSocialProfile(userId);
-  if (known) return known;
-  const found = await call('GET', `/profiles?externalId=${encodeURIComponent(userId)}`);
-  const list = Array.isArray(found.json?.profiles) ? found.json.profiles : Array.isArray(found.json) ? found.json : [];
-  let id = idOf(list.find((p) => p?.externalId === userId)) || idOf(found.json?.profile);
-  if (!id) {
-    const created = await call('POST', '/profiles', { name: `velorafy-${userId}`, externalId: userId });
-    id = idOf(created.json?.profile) || idOf(created.json);
-  }
-  if (!id) throw new SocialError('Publishing service did not return a profile id.');
-  setSocialProfile(userId, id);
-  return id;
-}
+const PLATFORM_DATA = {
+  // Quickstart (Post for Me's own credentials) requires the "organization" LinkedIn flow.
+  linkedin: { linkedin: { connection_type: 'organization' } },
+  instagram: { instagram: { connection_type: 'instagram' } },
+};
 
 export async function connectUrl(userId, platform) {
-  const profileId = await ensureProfile(userId);
-  const q = new URLSearchParams({ profileId });
-  if (config.socialRedirectUrl) q.set('redirect_url', config.socialRedirectUrl);
-  const { json } = await call('GET', `/connect/${encodeURIComponent(platform)}?${q}`);
-  if (!json?.authUrl) throw new SocialError('Publishing service did not return a connect link.');
-  return json.authUrl;
+  const r = await call('POST', '/social-accounts/auth-url', {
+    platform,
+    external_id: tag(userId),
+    permissions: ['posts', 'feeds'],
+    ...(PLATFORM_DATA[platform] ? { platform_data: PLATFORM_DATA[platform] } : {}),
+  });
+  if (!r?.url) throw new SocialError('The publishing service did not return a connect link.');
+  return r.url;
 }
 
+/** The user's own accounts only, without tokens. */
 export async function listAccounts(userId) {
-  const profileId = await ensureProfile(userId);
-  const { json } = await call('GET', `/accounts?profileId=${encodeURIComponent(profileId)}`);
-  const accounts = Array.isArray(json?.accounts) ? json.accounts : [];
-  // defence in depth: keep only accounts that really belong to this profile
-  return accounts
-    .filter((a) => !a.profileId || (a.profileId?._id || a.profileId) === profileId)
-    .map((a) => ({ account_id: a._id, platform: a.platform, username: a.username, active: a.isActive !== false }));
+  const out = [];
+  for (let offset = 0; offset < 500; offset += 100) {
+    const r = await call('GET', `/social-accounts?external_id=${encodeURIComponent(tag(userId))}&limit=100&offset=${offset}`);
+    const page = r?.data || [];
+    for (const a of page) {
+      if (a.external_id !== tag(userId)) continue; // never trust the filter alone
+      out.push({ account_id: a.id, platform: a.platform, username: a.username ?? null, connected: a.status !== 'disconnected' });
+    }
+    if (page.length < 100) break;
+  }
+  return out;
+}
+
+/** "2026-12-01T18:00:00" in "Asia/Baku" -> UTC ISO string. Strings with Z or an offset are kept as they are. */
+export function toUtcIso(local, timeZone) {
+  if (/[zZ]$|[+-]\d\d:?\d\d$/.test(local) || !timeZone) {
+    const d = new Date(local);
+    if (Number.isNaN(d.getTime())) throw new SocialError('scheduled_for is not a valid date/time.');
+    return d.toISOString();
+  }
+  const m = local.match(/^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?$/);
+  if (!m) throw new SocialError('scheduled_for must look like 2026-12-01T18:00:00.');
+  const asUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  let fmt;
+  try {
+    fmt = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch {
+    throw new SocialError(`Unknown timezone "${timeZone}". Use an IANA name like Asia/Baku or America/New_York.`);
+  }
+  const offsetAt = (ts) => {
+    const p = Object.fromEntries(fmt.formatToParts(new Date(ts)).map((x) => [x.type, x.value]));
+    return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ts;
+  };
+  let ts = asUtc - offsetAt(asUtc);
+  ts = asUtc - offsetAt(ts); // second pass handles DST edges
+  return new Date(ts).toISOString();
+}
+
+function accountConfig(platform, t, { aiGenerated, isVideo }) {
+  const ai = aiGenerated !== false;
+  switch (platform) {
+    case 'tiktok':
+    case 'tiktok_business':
+      return {
+        ...(t.title ? { title: t.title.slice(0, 90) } : {}),
+        privacy_status: t.privacy || 'public',
+        is_ai_generated: ai,
+        disclose_your_brand: false,
+        disclose_branded_content: false,
+        ...(t.tiktok_draft ? { is_draft: true } : {}),
+      };
+    case 'youtube':
+      return {
+        ...(t.title ? { title: t.title.slice(0, 100) } : {}),
+        privacy_status: ['public', 'private', 'unlisted'].includes(t.privacy) ? t.privacy : 'public',
+        made_for_kids: false,
+        contains_synthetic_media: ai,
+      };
+    case 'instagram':
+      return { placement: isVideo ? 'reels' : 'timeline' };
+    case 'facebook':
+      return { placement: isVideo ? 'reels' : 'timeline' };
+    case 'threads':
+      return { placement: 'timeline' };
+    case 'x':
+      return { made_with_ai: ai };
+    case 'pinterest':
+    case 'linkedin':
+      return t.title ? { title: t.title.slice(0, 100) } : {};
+    default:
+      return {};
+  }
 }
 
 /**
- * targets: [{ account_id, youtube_title? }]
+ * targets: [{ account_id, title?, privacy?, tiktok_draft? }]
  * mode: 'now' | 'schedule' | 'draft'
+ * aiGenerated: label the post as AI-made where the platform supports it (default true)
  */
-export async function publish(userId, { mediaUrls, caption, targets, mode, scheduledFor, timezone }) {
-  const profileId = await ensureProfile(userId);
+export async function publish(userId, { mediaUrls, caption, targets, mode, scheduledFor, timezone, aiGenerated }) {
   const mine = new Map((await listAccounts(userId)).map((a) => [a.account_id, a]));
-  const platforms = [];
   for (const t of targets) {
-    const acc = mine.get(t.account_id);
-    if (!acc) throw new SocialError(`Account ${t.account_id} is not connected to this user.`, 403);
-    if (!acc.active) throw new SocialError(`The ${acc.platform} account @${acc.username} is disconnected; reconnect it first.`, 409);
-    const entry = { platform: acc.platform, accountId: acc.account_id };
-    if (acc.platform === 'youtube') entry.platformSpecificData = { title: (t.youtube_title || caption.split('\n')[0]).slice(0, 100) };
-    platforms.push(entry);
+    const a = mine.get(t.account_id);
+    if (!a) throw new SocialError(`Account ${t.account_id} is not one of this user's connected accounts. Call social_list_accounts.`, 403);
+    if (!a.connected) throw new SocialError(`The ${a.platform} account @${a.username} is disconnected. Reconnect it with social_connect_account.`, 409);
   }
-
+  const isVideo = mediaUrls.some((u) => /\.(mp4|mov|webm)$/i.test(u));
   const body = {
-    content: caption,
-    mediaItems: mediaUrls.map((url) => ({ url })),
-    platforms,
-    profileId,
-    externalId: `velorafy-${userId}`,
+    caption,
+    social_accounts: targets.map((t) => t.account_id),
+    media: mediaUrls.map((url) => ({ url })),
+    account_configurations: targets.map((t) => ({
+      social_account_id: t.account_id,
+      configuration: accountConfig(mine.get(t.account_id).platform, t, { aiGenerated, isVideo }),
+    })),
+    ...(mode === 'schedule' ? { scheduled_at: toUtcIso(scheduledFor, timezone) } : {}),
+    ...(mode === 'draft' ? { isDraft: true } : {}),
   };
-  if (mode === 'draft') body.isDraft = true;
-  else if (mode === 'schedule') {
-    body.scheduledFor = scheduledFor;
-    if (timezone) body.timezone = timezone;
-  } else body.publishNow = true;
-
-  const { status, json } = await call('POST', '/posts', body, { 'Idempotency-Key': crypto.randomUUID() });
-  const post = json?.post || {};
+  if (mode === 'schedule' && new Date(body.scheduled_at).getTime() < Date.now() + 60_000) {
+    throw new SocialError('scheduled_for must be at least a minute in the future.', 400);
+  }
+  const post = await call('POST', '/social-posts', body);
   return {
-    httpStatus: status,
-    postId: post._id,
-    status: post.status,
-    platforms: post.platforms || json?.platformResults,
-    error: json?.error,
-    warnings: json?.warnings,
+    postId: post?.id,
+    status: post?.status,
+    scheduledAt: post?.scheduled_at ?? null,
+    accounts: targets.map((t) => ({ account_id: t.account_id, platform: mine.get(t.account_id).platform })),
   };
+}
+
+/** Per-account outcome of a post that belongs to this user. */
+export async function postStatus(userId, postId) {
+  const post = await call('GET', `/social-posts/${encodeURIComponent(postId)}`);
+  const accounts = post?.social_accounts || [];
+  if (!accounts.length || accounts.some((a) => a.external_id !== tag(userId))) {
+    throw new SocialError('Unknown post_id.', 404);
+  }
+  const byId = new Map(accounts.map((a) => [a.id, a]));
+  const r = await call('GET', `/social-post-results?post_id=${encodeURIComponent(postId)}&limit=50`);
+  const raw = r?.data || [];
+  const results = raw.map((x) => ({
+    platform: byId.get(x.social_account_id)?.platform,
+    username: byId.get(x.social_account_id)?.username ?? null,
+    success: !!x.success,
+    url: x.platform_data?.url ?? null,
+    error: x.success ? null : x.error || x.details?.error || 'failed',
+  }));
+  const pending = accounts.filter((a) => !raw.some((x) => x.social_account_id === a.id)).length;
+  return { postId, status: post.status, scheduledAt: post.scheduled_at ?? null, results, pending };
 }
