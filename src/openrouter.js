@@ -129,7 +129,7 @@ export async function transcribe({ bytes, format, language }) {
     response_format: 'verbose_json',
     timestamp_granularities: ['word', 'segment'],
   };
-  if (language) body.language = language;
+  if (language && /^[a-z]{2}/i.test(language)) body.language = language.slice(0, 2).toLowerCase(); // ISO-639-1 only
   const res = await request('/audio/transcriptions', { method: 'POST', body, timeoutMs: 280_000 });
   if (!res.ok) throw await readError(res);
   return res.json();

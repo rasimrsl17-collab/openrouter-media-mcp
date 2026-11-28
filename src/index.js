@@ -742,7 +742,16 @@ function buildServer(userId) {
         }
         const content = [];
         const links = [];
+        const startedAt = Date.now();
         for (const [i, c] of args.clips.entries()) {
+          // LibreChat drops MCP calls after 300 s; a slow droplet needs up to ~80 s per long clip.
+          if (i > 0 && Date.now() - startedAt > 150_000) {
+            links.push(
+              `Clips ${i + 1}-${args.clips.length} were not cut yet (time limit for one call). ` +
+                'Call cut_clips again with just those clips.',
+            );
+            break;
+          }
           try {
             const out = await renderClip({
               sourceFile: file,
@@ -1021,7 +1030,9 @@ const httpServer = app.listen(config.port, () => {
 httpServer.requestTimeout = 0;
 httpServer.headersTimeout = 120_000;
 
+clips.recoverSources();
 setInterval(() => {
+  clips.cleanupSources();
   const n = cleanupOldMedia();
   if (n) console.log(`[cleanup] removed ${n} old media files`);
 }, 6 * 3600_000).unref();

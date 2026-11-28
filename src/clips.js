@@ -59,6 +59,24 @@ export function cleanupSources() {
   }
 }
 
+/** After a restart, jobs that were in progress can never finish: mark them failed so agents stop waiting. */
+export function recoverSources() {
+  ensureDir();
+  for (const name of fs.readdirSync(dir())) {
+    if (!name.endsWith('.json')) continue;
+    const id = name.slice(0, -5);
+    const meta = readMeta(id);
+    if (meta && meta.status !== 'ready' && meta.status !== 'failed') {
+      try {
+        fs.unlinkSync(videoPath(id));
+      } catch {
+        /* ignore */
+      }
+      writeMeta(id, { ...meta, status: 'failed', error: 'The server restarted while processing. Please load the video again.' });
+    }
+  }
+}
+
 // ---------------- safe download ----------------
 function isPrivateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -164,7 +182,37 @@ function download(url, file, redirectsLeft = 5) {
 }
 
 // ---------------- transcription ----------------
-const CHUNK_SECONDS = 20 * 60; // 32 kbps mono -> ~4.8 MB per chunk, safe for every STT provider
+// OpenRouter's upstream STT providers time out after ~60 s per request, so long audio is split
+// into short chunks and sent a few at a time. 32 kbps mono -> ~1.9 MB per 8-minute chunk.
+const CHUNK_SECONDS = 8 * 60;
+const STT_PARALLEL = 3;
+
+/** Some providers return segments but no word timestamps: spread each segment's words over its time. */
+export function wordsFromSegments(segments) {
+  const out = [];
+  for (const s of segments || []) {
+    const tokens = String(s.text || '').trim().split(/\s+/).filter(Boolean);
+    const span = Math.max(0.01, s.end - s.start);
+    const totalChars = tokens.reduce((a, t) => a + t.length, 0) || 1;
+    let t = s.start;
+    for (const tok of tokens) {
+      const d = (span * tok.length) / totalChars;
+      out.push({ word: tok, start: +t.toFixed(2), end: +(t + d).toFixed(2) });
+      t += d;
+    }
+  }
+  return out;
+}
+
+async function transcribeWithRetry(args) {
+  try {
+    return await transcribe(args);
+  } catch (err) {
+    if (err?.status && err.status < 500 && err.status !== 408 && err.status !== 429) throw err;
+    await new Promise((r) => setTimeout(r, 3000));
+    return transcribe(args);
+  }
+}
 
 async function transcribeFile(videoFile, language) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'stt-'));
@@ -175,19 +223,37 @@ async function transcribeFile(videoFile, language) {
         '-f', 'segment', '-segment_time', String(CHUNK_SECONDS), '-reset_timestamps', '1', path.join(tmp, 'part%03d.mp3')],
       15 * 60_000,
     );
-    const parts = fs.readdirSync(tmp).filter((f) => f.endsWith('.mp3')).sort();
+    const parts = fs.readdirSync(tmp).filter((f) => f.endsWith('.mp3')).sort().map((f) => path.join(tmp, f));
+    // real chunk lengths (segment cuts land on audio frames, not exactly on CHUNK_SECONDS)
+    const offsets = [];
+    let acc = 0;
+    for (const p of parts) {
+      offsets.push(acc);
+      acc += (await probe(p)).seconds || CHUNK_SECONDS;
+    }
+    const results = new Array(parts.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < parts.length) {
+        const i = next++;
+        results[i] = await transcribeWithRetry({ bytes: fs.readFileSync(parts[i]), format: 'mp3', language });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(STT_PARALLEL, parts.length) }, worker));
+
     const words = [];
     const segments = [];
     let cost = 0;
     let lang;
-    for (const [i, part] of parts.entries()) {
-      const offset = i * CHUNK_SECONDS;
-      const r = await transcribe({ bytes: fs.readFileSync(path.join(tmp, part)), format: 'mp3', language });
+    results.forEach((r, i) => {
+      const offset = offsets[i];
       lang ??= r.language;
       cost += Number(r.usage?.cost) || 0;
-      for (const w of r.words || []) words.push({ word: w.word, start: +(w.start + offset).toFixed(2), end: +(w.end + offset).toFixed(2) });
-      for (const s of r.segments || []) segments.push({ start: +(s.start + offset).toFixed(2), end: +(s.end + offset).toFixed(2), text: String(s.text).trim() });
-    }
+      const segs = (r.segments || []).map((s) => ({ start: s.start, end: s.end, text: String(s.text).trim() }));
+      const ws = r.words?.length ? r.words : wordsFromSegments(segs);
+      for (const w of ws) words.push({ word: w.word, start: +(w.start + offset).toFixed(2), end: +(w.end + offset).toFixed(2) });
+      for (const s of segs) segments.push({ start: +(s.start + offset).toFixed(2), end: +(s.end + offset).toFixed(2), text: s.text });
+    });
     return { words, segments, cost, language: lang };
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -196,8 +262,9 @@ async function transcribeFile(videoFile, language) {
 
 /** Transcribe an audio file this server made (voiceover) -> word timestamps. */
 export async function transcribeVoice(file, language) {
-  const r = await transcribe({ bytes: fs.readFileSync(file), format: path.extname(file).slice(1) || 'mp3', language });
-  return { words: (r.words || []).map((w) => ({ word: w.word, start: w.start, end: w.end })), cost: Number(r.usage?.cost) || 0 };
+  const r = await transcribeWithRetry({ bytes: fs.readFileSync(file), format: path.extname(file).slice(1) || 'mp3', language });
+  const words = r.words?.length ? r.words : wordsFromSegments(r.segments);
+  return { words: words.map((w) => ({ word: w.word, start: w.start, end: w.end })), cost: Number(r.usage?.cost) || 0 };
 }
 
 // ---------------- jobs ----------------

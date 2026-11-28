@@ -24,12 +24,24 @@ export class StudioError extends Error {}
 // ---- tiny semaphore: a 1-2 vCPU droplet should not encode many videos at once ----
 let running = 0;
 const waiting = [];
-export async function acquire() {
+export async function acquire(maxWaitMs = 90_000) {
   if (running < Math.max(1, config.maxConcurrentRenders)) {
     running++;
     return;
   }
-  await new Promise((r) => waiting.push(r));
+  // Don't queue forever: LibreChat gives up on a tool call after 300 s anyway.
+  await new Promise((resolve, reject) => {
+    const entry = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      const i = waiting.indexOf(entry);
+      if (i >= 0) waiting.splice(i, 1);
+      reject(new StudioError('The video server is busy with other renders. Try again in a minute.'));
+    }, maxWaitMs);
+    waiting.push(entry);
+  });
   running++;
 }
 export function release() {
@@ -334,7 +346,7 @@ export async function renderClip({ sourceFile, start, end, framing = 'center', w
     let graph =
       framing === 'fit'
         ? `[0:v]split=2[bg][fg];` +
-          `[bg]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:2,eq=brightness=-0.08[bgb];` +
+          `[bg]scale=${W / 8}:${H / 8}:force_original_aspect_ratio=increase,crop=${W / 8}:${H / 8},boxblur=6:2,eq=brightness=-0.08,scale=${W}:${H}[bgb];` +
           `[fg]scale=${W}:-2[fgs];[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=${FPS},format=yuv420p[vc]`
         : `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS},format=yuv420p[vc]`;
 
