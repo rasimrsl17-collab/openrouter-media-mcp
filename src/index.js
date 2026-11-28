@@ -12,6 +12,7 @@
 //             iframe where the model places the UI marker.
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import express from 'express';
 import sharp from 'sharp';
 import { z } from 'zod';
@@ -33,7 +34,9 @@ import {
   addMediaSpend,
   localMediaPath,
 } from './storage.js';
-import { renderShort, kindOf, StudioError } from './studio.js';
+import { renderShort, renderClip, kindOf, listMusic, pickMusic, StudioError } from './studio.js';
+import * as clips from './clips.js';
+import { transcribeVoice } from './clips.js';
 import * as social from './social.js';
 
 const PCM_ONLY_PREFIXES = ['google/gemini', 'heygen/']; // per OpenRouter TTS docs: these return only pcm
@@ -502,9 +505,12 @@ function buildServer(userId) {
         title: 'Assemble short video',
         description:
           'Combine scenes (images and/or video clips made earlier with generate_image / generate_video) plus an optional ' +
-          'voiceover (from generate_speech) and per-scene captions into ONE vertical 1080x1920 MP4 for YouTube Shorts, ' +
-          'TikTok and Reels. Use the full-size /media/ links those tools returned. If the voiceover is longer than the ' +
-          `scenes, the last scene is held until the speech ends. Max ${config.maxShortSeconds}s. No extra AI cost.`,
+          'voiceover (from generate_speech) into ONE vertical 1080x1920 MP4 for YouTube Shorts, TikTok and Reels. ' +
+          'Still images get a slow zoom/pan (motion). With a voiceover, captions are word-by-word in sync with the speech ' +
+          '(active word highlighted); without one, each scene shows its caption. Optional background music ducks under the voice. ' +
+          'Use the full-size /media/ links those tools returned. If the voiceover is longer than the scenes, the last scene is ' +
+          `held until the speech ends. Max ${config.maxShortSeconds}s. Cost: free, plus a tiny speech-recognition fee for word captions.` +
+          (listMusic().length ? ` Music tracks: ${listMusic().map((t) => t.name).join(', ')} (or a mood prefix, e.g. "calm").` : ''),
         inputSchema: {
           scenes: z
             .array(
@@ -517,6 +523,14 @@ function buildServer(userId) {
             .min(1)
             .max(15),
           voiceover_url: z.string().url().optional().describe('The /media/ mp3 link returned by generate_speech'),
+          caption_style: z
+            .enum(['words', 'scene', 'none'])
+            .optional()
+            .describe('words = synced word-by-word from the voiceover (default when there is a voiceover); scene = each scene caption; none'),
+          title: z.string().max(60).optional().describe('Optional hook text pinned at the top, e.g. "3 facts nobody tells you"'),
+          motion: z.boolean().optional().describe('Animate still images with zoom/pan (default true)'),
+          music: z.string().max(60).optional().describe('Background music track name or mood prefix (see description); omit for none'),
+          language: z.string().max(5).optional().describe('ISO code of the voiceover language (e.g. en, tr, es) for better word captions'),
         },
       },
       async (args) => {
@@ -538,9 +552,35 @@ function buildServer(userId) {
             return fail('voiceover_url must be an audio link created by generate_speech (…/media/….mp3).');
           }
         }
+        let musicFile;
+        if (args.music) {
+          const t = pickMusic(args.music);
+          if (!t) {
+            const names = listMusic().map((x) => x.name);
+            return fail(names.length ? `No music track matches "${args.music}". Available: ${names.join(', ')}.` : 'No background music is installed on this server; leave music empty.');
+          }
+          musicFile = t.file;
+        }
+        const style = args.caption_style ?? (voiceFile ? 'words' : 'scene');
+        if (style === 'none') scenes.forEach((s) => delete s.caption);
+        let words;
+        let sttNote = '';
+        if (style === 'words' && voiceFile) {
+          try {
+            const r = await transcribeVoice(voiceFile, args.language);
+            words = r.words;
+            const charged = r.cost * config.costMarkup;
+            if (charged > 0) addMediaSpend(userId, charged);
+            logUsage({ kind: 'stt', userId, model: config.sttModel, cost: r.cost, charged });
+            if (!words.length) sttNote = ' (No words were recognised in the voiceover, so scene captions were used instead.)';
+          } catch (err) {
+            console.error('[assemble_short stt]', err?.message || err);
+            sttNote = ' (Word captions were unavailable, so scene captions were used instead.)';
+          }
+        }
         let out;
         try {
-          out = await renderShort({ scenes, voiceFile });
+          out = await renderShort({ scenes, voiceFile, words, musicFile, motion: args.motion ?? true, title: args.title });
         } catch (err) {
           if (err instanceof StudioError) return fail(err.message);
           console.error('[assemble_short]', err);
@@ -553,12 +593,184 @@ function buildServer(userId) {
         return {
           content: [
             text(
-              `Short video ready (${out.seconds.toFixed(1)}s, 1080x1920). Show it by placing the UI Resource Marker given below ` +
+              `Short video ready (${out.seconds.toFixed(1)}s, 1080x1920)${sttNote}. Show it by placing the UI Resource Marker given below ` +
                 `in your reply, and give the download link. Use this exact link as video_url when publishing: ${saved.url}`,
             ),
             playerResource('video', saved.fileName.split('.')[0], saved.url, 'video/mp4'),
           ],
         };
+      },
+    );
+  }
+
+  // ----- Creator Studio: long video -> clips -----
+  if (config.limitSourceMinutesPerDay > 0 && config.limitClipsPerDay > 0) {
+    const sourceReply = (meta) => {
+      if (!meta) return fail('Unknown source_id. Start again with transcribe_video.');
+      if (meta.status === 'failed') return fail(`Processing the video failed: ${meta.error}`);
+      if (meta.status !== 'ready') {
+        return {
+          content: [
+            text(
+              `Still ${meta.status} (source_id: ${meta.id}). Tell the user it is in progress, then call get_video_transcript ` +
+                'with this source_id again (it waits up to a few minutes each time).',
+            ),
+          ],
+        };
+      }
+      const min = Math.floor(meta.seconds / 60);
+      const sec = Math.round(meta.seconds % 60);
+      return {
+        content: [
+          text(
+            `Video ready (source_id: ${meta.id}, ${min}m${String(sec).padStart(2, '0')}s, ${meta.width}x${meta.height}` +
+              `${meta.language ? `, language: ${meta.language}` : ''}). Timestamped transcript below. Pick the strongest self-contained ` +
+              `moments (a clear hook in the first 2 seconds, one idea, a satisfying ending), each 15-${config.maxShortSeconds}s, and ` +
+              'call cut_clips with exact start/end seconds taken from these timestamps.\n\n' +
+              clips.transcriptText(meta),
+          ),
+        ],
+      };
+    };
+
+    server.registerTool(
+      'transcribe_video',
+      {
+        title: 'Load a long video for clipping',
+        description:
+          "Load the user's own long video (podcast, interview, stream, lesson) from a link and transcribe it with timestamps, " +
+          'so you can choose the best moments and turn them into vertical clips with cut_clips. Accepts direct https video links, ' +
+          'Google Drive share links ("Anyone with the link") and Dropbox links. YouTube/TikTok/Instagram page links are NOT supported; ' +
+          `ask for the file instead. Max ${config.maxSourceMinutes} min, ${config.maxSourceMb} MB. ` +
+          `Cost: about $${(config.clipUsdPerMinute * config.costMarkup).toFixed(3)} per minute of video. ` +
+          'The user must own the video or have the right to reuse it.',
+        inputSchema: {
+          url: z.string().url().describe('Link to the video file'),
+          language: z.string().max(5).optional().describe('ISO code of the spoken language if known (e.g. en, tr, es)'),
+        },
+      },
+      async ({ url, language }) => {
+        if (userId === 'anonymous') return fail('Clipping needs a signed-in user. Ask the user to sign in again.');
+        try {
+          clips.directUrl(url);
+        } catch (err) {
+          return fail(err.message);
+        }
+        const id = clips.startSource({
+          userId,
+          url,
+          language,
+          hooks: {
+            async check(minutes) {
+              const q = checkQuota(userId, 'source_min', minutes);
+              if (!q.ok) {
+                return { ok: false, message: `Daily video-minutes limit reached (${q.used}/${q.limit} min used today; this video is ${minutes} min).` };
+              }
+              return reserve(userId, minutes * config.clipUsdPerMinute);
+            },
+            done(minutes, sttCost) {
+              consumeQuota(userId, 'source_min', minutes);
+              const charged = minutes * config.clipUsdPerMinute * config.costMarkup;
+              addMediaSpend(userId, charged);
+              logUsage({ kind: 'source', userId, minutes, cost: sttCost, charged });
+            },
+          },
+        });
+        return sourceReply(await clips.waitSource(id, config.sourceWaitSeconds));
+      },
+    );
+
+    server.registerTool(
+      'get_video_transcript',
+      {
+        title: 'Get long-video transcript',
+        description: 'Check a video loaded with transcribe_video. Waits a few minutes if it is still processing, then returns the timestamped transcript.',
+        inputSchema: { source_id: z.string().describe('source_id returned by transcribe_video') },
+      },
+      async ({ source_id }) => {
+        const meta = clips.readMeta(source_id);
+        if (!meta || meta.userId !== userId) return fail('Unknown source_id. Start again with transcribe_video.');
+        return sourceReply(await clips.waitSource(source_id, config.sourceWaitSeconds));
+      },
+    );
+
+    server.registerTool(
+      'cut_clips',
+      {
+        title: 'Cut vertical clips from a long video',
+        description:
+          'Cut moments from a video loaded with transcribe_video into vertical 1080x1920 clips with word-by-word captions, ' +
+          `ready for Shorts/TikTok/Reels. Up to ${config.maxClipsPerCall} clips per call, each 5-${config.maxShortSeconds}s. ` +
+          'framing: "center" crops the middle of the frame (best for one person talking to camera); "fit" keeps the whole frame ' +
+          'over a blurred background (best for two people, screen recordings, wide shots). No AI cost.',
+        inputSchema: {
+          source_id: z.string(),
+          clips: z
+            .array(
+              z.object({
+                start: z.number().min(0).describe('Start, in seconds from the beginning of the video'),
+                end: z.number().describe('End, in seconds'),
+                title: z.string().max(60).optional().describe('Hook text pinned at the top of the clip'),
+              }),
+            )
+            .min(1)
+            .max(Math.max(1, config.maxClipsPerCall)),
+          framing: z.enum(['center', 'fit']).optional(),
+          captions: z.boolean().optional().describe('Word-by-word captions (default true)'),
+          music: z.string().max(60).optional().describe('Optional background music track name or mood prefix'),
+        },
+      },
+      async (args) => {
+        const meta = clips.readMeta(args.source_id);
+        if (!meta || meta.userId !== userId) return fail('Unknown source_id. Load the video with transcribe_video first.');
+        if (meta.status !== 'ready') return sourceReply(meta);
+        const file = clips.videoPath(meta.id);
+        if (!fs.existsSync(file)) return fail('This video has expired from the server. Load it again with transcribe_video.');
+        for (const [i, c] of args.clips.entries()) {
+          const len = c.end - c.start;
+          if (!(len >= 5 && len <= config.maxShortSeconds) || c.end > meta.seconds + 0.5) {
+            return fail(`Clip ${i + 1}: needs 5-${config.maxShortSeconds}s inside the video (0-${meta.seconds.toFixed(0)}s); got ${c.start}-${c.end}.`);
+          }
+        }
+        const q = checkQuota(userId, 'clip', args.clips.length);
+        if (!q.ok) return quotaError('clip', q);
+        let musicFile;
+        if (args.music) {
+          const t = pickMusic(args.music);
+          if (!t) return fail(`No music track matches "${args.music}".`);
+          musicFile = t.file;
+        }
+        const content = [];
+        const links = [];
+        for (const [i, c] of args.clips.entries()) {
+          try {
+            const out = await renderClip({
+              sourceFile: file,
+              start: c.start,
+              end: Math.min(c.end, meta.seconds),
+              framing: args.framing ?? 'center',
+              words: args.captions === false ? [] : meta.words,
+              title: c.title,
+              musicFile,
+            });
+            const saved = saveMedia(out.bytes, 'video/mp4');
+            if (!saved.url) return fail('PUBLIC_BASE_URL is not configured, so the clips cannot be shown.');
+            consumeQuota(userId, 'clip', 1);
+            logUsage({ kind: 'clip', userId, seconds: out.seconds });
+            links.push(`Clip ${i + 1} (${out.seconds.toFixed(1)}s): ${saved.url}`);
+            content.push(playerResource('video', saved.fileName.split('.')[0], saved.url, 'video/mp4'));
+          } catch (err) {
+            if (!(err instanceof StudioError)) console.error('[cut_clips]', err);
+            links.push(`Clip ${i + 1}: failed (${err?.message || err})`);
+          }
+        }
+        content.unshift(
+          text(
+            'Clips are done. Show each one by placing its UI Resource Marker in your reply and list the links. ' +
+              'Use these exact links as media when publishing:\n' + links.join('\n'),
+          ),
+        );
+        return { content };
       },
     );
   }

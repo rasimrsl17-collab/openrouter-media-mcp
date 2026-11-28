@@ -34,7 +34,10 @@ LibreChat agentlərinə alət kimi verən MCP server.
 | `check_video_status` | job_id ilə nəticəni alır (yalnız job-u yaradan istifadəçi) |
 | `generate_speech` | Mətndən MP3 səs + pleyer |
 | `list_media_models` | İcazəli modellər, parametrlər, səslər |
-| `assemble_short` | Səhnələr + səsləndirmə + altyazı → hazır 1080x1920 MP4 (Shorts/TikTok/Reels), ffmpeg, AI xərci yoxdur |
+| `assemble_short` | Səhnələr (zoom/pan) + səsləndirmə + sözbəsöz altyazı + fon musiqisi → hazır 1080x1920 MP4 (Shorts/TikTok/Reels), ffmpeg, AI xərci yoxdur |
+| `transcribe_video` | Uzun videonu linkdən yükləyib zaman damğalı mətnə çevirir |
+| `get_video_transcript` | Emal davam edirsə nəticəni gözləyib qaytarır |
+| `cut_clips` | Uzun videodan seçilmiş anları altyazılı vertikal kliplərə çevirir |
 | `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Zernio OAuth) |
 | `social_list_accounts` | İstifadəçinin YALNIZ öz qoşulmuş hesabları |
 | `social_publish` | İndi paylaş / vaxta planla / qaralama — yalnız öz hesablarına, yalnız bu serverin yaratdığı media |
@@ -86,7 +89,26 @@ Agentin təlimatı: [`deploy/creator-agent-prompt.md`](deploy/creator-agent-prom
 - Yalnız bu serverin öz `/media/` faylları qəbul olunur (kənar URL, `../` hiylələri rədd edilir).
 - Səs səhnələrdən uzundursa, son səhnə səs bitənə qədər uzadılır — nitq kəsilmir.
 - Altyazı ASS ilə yandırılır (DejaVu Sans Bold; ə, ğ, ş, ç, ı, ö, ü düzgün görünür).
+- Şəkillər sabit qalmır: yavaş zoom/pan (Ken Burns) effekti, səhnədən-səhnəyə növbə ilə dəyişir.
+- Səsləndirmə varsa altyazı **sözbəsöz** gedir (danışılan söz sarı yanır) — vaxtları OpenRouter-in
+  `STT_MODEL` (Whisper, ~$0.11/saat) danışıq tanıması verir. Alınmasa, səhnə altyazısına qayıdır.
+- Fon musiqisi: `MUSIC_DIR` (`/data/music`) qovluğuna **hüququ sizdə olan** royalty-free mp3 qoyun,
+  adı əhvala görə: `calm-1.mp3`, `upbeat-1.mp3`… Agent `music: "calm"` deyəndə birini seçir; danışıq
+  zamanı musiqi avtomatik səssizləşir (ducking), sonda yavaşca sönür.
+  Konteynerə köçürmək: `docker cp calm-1.mp3 openrouter-media:/data/music/`
 - `MAX_CONCURRENT_RENDERS=1` — kiçik droplet-də eyni anda bir video kodlanır, qalanlar növbə gözləyir.
+
+**Uzun video → kliplər (`transcribe_video`, `get_video_transcript`, `cut_clips`)**
+- İstifadəçi öz videosunun linkini verir (birbaşa https, Google Drive "Anyone with the link", Dropbox).
+  YouTube/TikTok səhifə linkləri yüklənmir — bu həm texniki, həm də hüquqi səbəbdəndir.
+- Server videonu yükləyir, səsi Whisper ilə zaman damğalı mətnə çevirir; agent ən güclü anları seçir,
+  `cut_clips` onları 1080x1920 klipə çevirir (sözbəsöz altyazı, başlıq; `center` və ya bulanıq fonlu `fit`).
+- Qiymət: `CLIP_USD_PER_MINUTE` × `COST_MARKUP` hər video dəqiqəsinə (default $0.01 × 1.5);
+  real xərc ~$0.002/dəq. Kəsmək pulsuzdur, yalnız gündəlik limit var.
+- Təhlükəsizlik: yalnız https, hər yönləndirmə yoxlanır, daxili/özəl IP-lərə bağlantı qadağandır (SSRF),
+  ölçü (`MAX_SOURCE_MB`) və uzunluq (`MAX_SOURCE_MINUTES`) limiti, başqa istifadəçinin `source_id`-si işləmir.
+- Yüklənən videolar `/data/state/sources`-da `SOURCE_TTL_HOURS` (48) saat qalıb silinir — diskə diqqət:
+  90 dəqiqəlik video 1–1.5 GB ola bilər.
 
 **Paylaşım (Zernio, multi-tenant)**
 1. zernio.com-da qeydiyyat → API açarı (`sk_...`) → `.env`-də `ZERNIO_API_KEY`.

@@ -87,6 +87,8 @@ const LIMITS = {
   tts: () => config.limitTtsPerDay,
   short: () => config.limitShortsPerDay,
   post: () => config.limitPostsPerDay,
+  source_min: () => config.limitSourceMinutesPerDay,
+  clip: () => config.limitClipsPerDay,
 };
 
 /** Path of a file this server saved, from its public /media URL; null for anything else. */

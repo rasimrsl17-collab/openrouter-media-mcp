@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { execFileSync } from 'node:child_process';
-import { start, seen, startLitellm, customers, litellmSeen, startZernio, zernio, zernioSeen } from './mock-openrouter.js';
+import { start, seen, startLitellm, customers, litellmSeen, startZernio, zernio, zernioSeen, sttSeen } from './mock-openrouter.js';
 
 const MOCK_PORT = 4555;
 const MCP_PORT = 3499;
@@ -26,6 +26,8 @@ customers.set('user-C', { spend: 0, max_budget: 0.25 });
 customers.set('user-V', { spend: 0, max_budget: 10 });
 customers.set('user-BLOCKED', { spend: 0, max_budget: 100, blocked: true });
 
+fs.mkdirSync(path.join(tmp, 'music'), { recursive: true });
+execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=220:duration=4', '-c:a', 'libmp3lame', path.join(tmp, 'music', 'calm-1.mp3')]);
 const proc = spawn(process.execPath, ['src/index.js'], {
   env: {
     ...process.env,
@@ -49,8 +51,14 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     ZERNIO_BASE_URL: `http://127.0.0.1:${ZN_PORT}`,
     SOCIAL_REDIRECT_URL: 'https://velorafy.example/back',
     SOCIAL_POST_FEE_USD: '0.02',
-    LIMIT_SHORTS_PER_DAY: '3',
+    LIMIT_SHORTS_PER_DAY: '4',
     MAX_SHORT_SECONDS: '30',
+    MUSIC_DIR: path.join(tmp, 'music'),
+    ALLOW_PRIVATE_SOURCE_URLS: 'true', // the test serves the long video from 127.0.0.1
+    LIMIT_SOURCE_MINUTES_PER_DAY: '1',
+    LIMIT_CLIPS_PER_DAY: '3',
+    MAX_CLIPS_PER_CALL: '2',
+    SOURCE_WAIT_SECONDS: '60',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -83,8 +91,8 @@ try {
   const client = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-A' });
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
-    'assemble_short', 'check_video_status', 'generate_image', 'generate_speech', 'generate_video', 'list_media_models',
-    'social_connect_account', 'social_list_accounts', 'social_publish',
+    'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_video_transcript', 'list_media_models',
+    'social_connect_account', 'social_list_accounts', 'social_publish', 'transcribe_video',
   ]);
   ok('tools listed: ' + tools.join(', '));
 
@@ -301,7 +309,22 @@ try {
   assert.ok(probe.streams.some((x) => x.codec_type === 'audio'), 'has audio track');
   const dur = Number(probe.format.duration);
   assert.ok(dur >= 5.5 && dur < 6.3, 'last scene stretched to cover the 5.5 s voiceover, got ' + dur);
-  ok(`assemble_short -> 1080x1920 H.264+AAC, ${dur.toFixed(2)}s (scenes 4.5s, stretched to voiceover), captions burned`);
+  const stt = sttSeen.at(-1);
+  assert.equal(stt.model, 'openai/whisper-large-v3');
+  assert.deepEqual(stt.granularities, ['word', 'segment']);
+  assert.ok(stt.bytes > 1000 && stt.format === 'mp3');
+  ok(`assemble_short -> 1080x1920 H.264+AAC, ${dur.toFixed(2)}s (scenes 4.5s, stretched to voiceover), word captions from STT`);
+
+  const sttBefore = sttSeen.length;
+  r = await sC.callTool({
+    name: 'assemble_short',
+    arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 3, caption: 'hi' }], voiceover_url: voiceUrl, caption_style: 'scene', music: 'calm', title: 'Hook', motion: false },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.equal(sttSeen.length, sttBefore, 'scene captions do not call STT');
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 2 }], music: 'disco' } });
+  assert.ok(r.isError && /calm-1/.test(r.content[0].text), 'unknown music lists available tracks');
+  ok('assemble_short: music by mood prefix (ducked), title, static mode; unknown track rejected with the list');
 
   r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 2 }] } });
   assert.ok(!r.isError, 'works without voiceover (silent track)');
@@ -315,9 +338,57 @@ try {
   assert.ok(r.isError && /at most 30s/.test(r.content[0].text), JSON.stringify(r));
   ok('assemble_short rejects foreign URLs, path tricks, non-audio voiceover and over-length videos');
   r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 1 }] } });
+  assert.ok(!r.isError);
   r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 1 }] } });
   assert.ok(r.isError && /Daily short video limit/.test(r.content[0].text), JSON.stringify(r));
-  ok('daily short-video limit enforced (3)');
+  ok('daily short-video limit enforced (4)');
+
+
+  // ---- long video -> clips ----
+  const srcName = 'b'.repeat(32) + '.mp4';
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:d=40', '-f', 'lavfi', '-i', 'sine=frequency=300:duration=40',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', path.join(tmp, 'media', srcName)]);
+  const srcUrl = `http://127.0.0.1:${MCP_PORT}/media/${srcName}`;
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: 'https://www.youtube.com/watch?v=abc' } });
+  assert.ok(r.isError && /cannot be downloaded/.test(r.content[0].text));
+  const mediaBefore = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: srcUrl, language: 'en' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const sourceId = r.content[0].text.match(/source_id: ([a-f0-9]{24})/)[1];
+  assert.ok(/\[0:00-0:0\d\] This is the best part/.test(r.content[0].text), r.content[0].text.slice(0, 400));
+  const mediaAfter = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  assert.ok(Math.abs(mediaAfter - mediaBefore - 0.01 * 1 * 1.5) < 1e-9, `charged 1 min x $0.01 x 1.5, got ${mediaAfter - mediaBefore}`);
+  ok('transcribe_video: downloads, transcribes with timestamps, charges per minute with markup; refuses YouTube page links');
+
+  const otherC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-B' });
+  r = await otherC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 0, end: 10 }] } });
+  assert.ok(r.isError && /Unknown source_id/.test(r.content[0].text));
+  r = await sC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 0, end: 3 }] } });
+  assert.ok(r.isError && /5-30s/.test(r.content[0].text));
+  ok("cut_clips: other users cannot use someone else's source; length limits enforced");
+
+  r = await sC.callTool({
+    name: 'cut_clips',
+    arguments: { source_id: sourceId, framing: 'fit', clips: [{ start: 2, end: 9, title: 'Best part' }, { start: 20, end: 27.5 }] },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const clipUrls = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp4/g);
+  assert.equal(clipUrls.length, 2);
+  for (const [i, u] of clipUrls.entries()) {
+    const pr = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json',
+      path.join(tmp, 'media', u.split('/').pop())]).toString());
+    const v = pr.streams.find((x) => x.codec_type === 'video');
+    assert.deepEqual([v.width, v.height], [1080, 1920]);
+    const d = Number(pr.format.duration);
+    assert.ok(Math.abs(d - [7, 7.5][i]) < 0.25, 'clip length ' + d);
+  }
+  r = await sC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 10, end: 16 }, { start: 30, end: 36 }] } });
+  assert.ok(r.isError && /Daily clip limit/.test(r.content[0].text), JSON.stringify(r));
+  r = await sC.callTool({ name: 'get_video_transcript', arguments: { source_id: sourceId } });
+  assert.ok(!r.isError && r.content[0].text.includes(sourceId));
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: srcUrl } });
+  assert.ok(r.isError && /video-minutes limit/.test(r.content[0].text), JSON.stringify(r));
+  ok('cut_clips -> vertical 1080x1920 clips (fit framing, title, word captions); daily clip + minutes limits enforced');
 
   // ---- social publishing ----
   r = await sC.callTool({ name: 'social_connect_account', arguments: { platform: 'youtube' } });

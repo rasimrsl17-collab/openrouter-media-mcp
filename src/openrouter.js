@@ -115,3 +115,22 @@ export async function listSpeechModels() {
   if (!res.ok) throw await readError(res);
   return (await res.json()).data ?? [];
 }
+
+/**
+ * Speech-to-text with word timestamps.
+ * POST /audio/transcriptions  { model, input_audio: { data(base64), format }, response_format: 'verbose_json',
+ *   timestamp_granularities: ['word','segment'], language? }
+ *   -> { text, words?: [{ word, start, end }], segments?: [{ start, end, text }], duration?, usage?: { cost, seconds } }
+ */
+export async function transcribe({ bytes, format, language }) {
+  const body = {
+    model: config.sttModel,
+    input_audio: { data: bytes.toString('base64'), format },
+    response_format: 'verbose_json',
+    timestamp_granularities: ['word', 'segment'],
+  };
+  if (language) body.language = language;
+  const res = await request('/audio/transcriptions', { method: 'POST', body, timeoutMs: 280_000 });
+  if (!res.ok) throw await readError(res);
+  return res.json();
+}

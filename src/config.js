@@ -81,6 +81,21 @@ export const config = {
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
   ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
   captionFont: process.env.CAPTION_FONT || 'DejaVu Sans',
+  // speech-to-text (word-timed captions + long-video transcripts); ~$0.11 per audio hour on OpenRouter
+  sttModel: process.env.STT_MODEL || 'openai/whisper-large-v3',
+  // royalty-free background tracks you own the rights to (*.mp3 / *.m4a); file name = track name
+  musicDir: process.env.MUSIC_DIR || '/data/music',
+
+  // ---- Creator Studio: long video -> clips ----
+  limitSourceMinutesPerDay: int('LIMIT_SOURCE_MINUTES_PER_DAY', 120), // 0 disables transcribe_video/cut_clips
+  maxSourceMinutes: int('MAX_SOURCE_MINUTES', 90),
+  maxSourceMb: int('MAX_SOURCE_MB', 1500),
+  sourceTtlHours: int('SOURCE_TTL_HOURS', 48),
+  clipUsdPerMinute: num('CLIP_USD_PER_MINUTE', 0.01), // charged per source-video minute (x COST_MARKUP)
+  limitClipsPerDay: int('LIMIT_CLIPS_PER_DAY', 30),
+  maxClipsPerCall: int('MAX_CLIPS_PER_CALL', 3), // keeps each call under LibreChat's MCP timeout
+  sourceWaitSeconds: int('SOURCE_WAIT_SECONDS', 200),
+  allowPrivateSourceUrls: process.env.ALLOW_PRIVATE_SOURCE_URLS === 'true', // tests only
 
   // ---- Creator Studio: publishing through Zernio (empty key = social tools disabled) ----
   zernioKey: process.env.ZERNIO_API_KEY || '',

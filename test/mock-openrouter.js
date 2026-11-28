@@ -98,6 +98,23 @@ app.post('/audio/speech', (req, res) => {
   if (req.body.response_format !== 'mp3') return res.status(400).json({ error: { message: 'pcm not supported' } });
   res.set('X-Generation-Id', 'gen-tts-1').type('audio/mpeg').send(Buffer.from('ID3FAKEMP3'.repeat(200)));
 });
+// Speech-to-text: fake words every 0.5 s, enough to cover any audio up to the decoded byte length.
+export const sttSeen = [];
+app.post('/audio/transcriptions', (req, res) => {
+  const b = req.body;
+  sttSeen.push({ model: b.model, format: b.input_audio?.format, bytes: Buffer.from(b.input_audio?.data || '', 'base64').length,
+    granularities: b.timestamp_granularities, language: b.language });
+  if (!b.input_audio?.data) return res.status(400).json({ error: { message: 'input_audio required' } });
+  const vocab = ['This', 'is', 'the', 'best', 'part,', 'listen', 'closely.', 'Then', 'we', 'win!'];
+  const words = [];
+  for (let t = 0.2, i = 0; t < 40; t += 0.5, i++) words.push({ word: vocab[i % vocab.length], start: +t.toFixed(2), end: +(t + 0.4).toFixed(2) });
+  const segments = [];
+  for (let i = 0; i < words.length; i += 10) {
+    const g = words.slice(i, i + 10);
+    segments.push({ start: g[0].start, end: g[g.length - 1].end, text: g.map((w) => w.word).join(' ') });
+  }
+  res.json({ text: words.map((w) => w.word).join(' '), language: b.language || 'english', duration: 40, words, segments, usage: { cost: 0.001, seconds: 40 } });
+});
 app.get('/models', (req, res) =>
   res.json({ data: [{ id: 'microsoft/mai-voice-2.1', name: 'MAI Voice 2.1', supported_voices: ['en-US-Harper:MAI-Voice-2.1'] }] }),
 );

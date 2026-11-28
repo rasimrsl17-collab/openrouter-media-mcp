@@ -14,7 +14,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
 
 # media files + quota/job state live here; mount a volume
-RUN mkdir -p /data/media /data/state && chown -R node:node /data
+RUN mkdir -p /data/media /data/state /data/music && chown -R node:node /data
 VOLUME ["/data"]
 
 USER node
