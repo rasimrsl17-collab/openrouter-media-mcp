@@ -53,6 +53,8 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     ZERNIO_BASE_URL: `http://127.0.0.1:${ZN_PORT}`,
     SOCIAL_REDIRECT_URL: 'https://velorafy.example/back',
     SOCIAL_POST_FEE_USD: '0.02',
+    ALLOWED_IMAGE_MODELS: 'google/gemini-3.1-flash-image,bytedance-seed/seedream-5-0-flash',
+    ALLOWED_VIDEO_MODELS: 'google/veo-3.1-lite,google/gemini-omni-1.2-flash,bytedance/seedance-2.0-mini',
     LIMIT_SHORTS_PER_DAY: '5',
     MAX_SHORT_SECONDS: '30',
     MUSIC_DIR: path.join(tmp, 'music'),
