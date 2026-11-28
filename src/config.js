@@ -41,8 +41,8 @@ export const config = {
   mediaTtlDays: int('MEDIA_TTL_DAYS', 30),
 
   // Admin-fixed model allowlists. The first entry is the default.
-  imageModels: list('ALLOWED_IMAGE_MODELS', 'google/gemini-3.1-flash-image,bytedance-seed/seedream-5-0-flash'),
-  videoModels: list('ALLOWED_VIDEO_MODELS', 'google/veo-3.1-lite,google/gemini-omni-1.2-flash,bytedance/seedance-2.0-mini'),
+  imageModels: list('ALLOWED_IMAGE_MODELS', 'recraft/recraft-v4.1-flash-v2,black-forest-labs/flux-3-image-klein,black-forest-labs/flux.2-klein-4b,bytedance-seed/seedream-5-0-flash'),
+  videoModels: list('ALLOWED_VIDEO_MODELS', 'heygen/heygen-video-1,x-ai/grok-imagine-video-1.5-lite,alibaba/wan-3.0,bytedance/seedance-2.0-mini,google/veo-3.1-lite'),
   ttsModels: list('ALLOWED_TTS_MODELS', 'elevenlabs/eleven-v4-turbo'),
   // Optional. Empty = use the first voice the model lists in the OpenRouter catalog.
   defaultTtsVoice: process.env.DEFAULT_TTS_VOICE || '',
@@ -71,12 +71,44 @@ export const config = {
   // Used only to refuse a call up front, and as the charge when OpenRouter reports no cost (speech).
   estimateImageUsd: num('ESTIMATE_IMAGE_USD', 0.08), // per image
   estimateVideoUsdPerSecond: num('ESTIMATE_VIDEO_USD_PER_SECOND', 0.08),
+  estimateSttUsd: num('ESTIMATE_STT_USD', 0.01), // credit held for word-caption speech recognition
   estimateTtsUsdPer1kChars: num('ESTIMATE_TTS_USD_PER_1K_CHARS', 0.03),
   topupUrl: process.env.TOPUP_URL || '',
 
   // Video polling inside one tool call. Keep below LibreChat's MCP `timeout`.
   videoMaxWaitSeconds: int('VIDEO_MAX_WAIT_SECONDS', 240),
   videoPollSeconds: int('VIDEO_POLL_SECONDS', 6),
+
+  // ---- Creator Studio: assemble_short (ffmpeg) ----
+  limitShortsPerDay: int('LIMIT_SHORTS_PER_DAY', 5), // 0 disables assemble_short
+  maxShortSeconds: int('MAX_SHORT_SECONDS', 90),
+  maxConcurrentRenders: int('MAX_CONCURRENT_RENDERS', 1), // ffmpeg is CPU-heavy on a small VPS
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+  ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
+  captionFont: process.env.CAPTION_FONT || 'DejaVu Sans',
+  // speech-to-text (word-timed captions + long-video transcripts); ~$0.11 per audio hour on OpenRouter
+  sttModel: process.env.STT_MODEL || 'openai/whisper-large-v3',
+  // royalty-free background tracks you own the rights to (*.mp3 / *.m4a); file name = track name
+  musicDir: process.env.MUSIC_DIR || '/data/music',
+
+  // ---- Creator Studio: long video -> clips ----
+  limitSourceMinutesPerDay: int('LIMIT_SOURCE_MINUTES_PER_DAY', 120), // 0 disables transcribe_video/cut_clips
+  maxSourceMinutes: int('MAX_SOURCE_MINUTES', 90),
+  maxSourceMb: int('MAX_SOURCE_MB', 1500),
+  sourceTtlHours: int('SOURCE_TTL_HOURS', 48),
+  clipUsdPerMinute: num('CLIP_USD_PER_MINUTE', 0.01), // charged per source-video minute (x COST_MARKUP)
+  limitClipsPerDay: int('LIMIT_CLIPS_PER_DAY', 30),
+  maxClipsPerCall: int('MAX_CLIPS_PER_CALL', 3), // keeps each call under LibreChat's MCP timeout
+  sourceWaitSeconds: int('SOURCE_WAIT_SECONDS', 200),
+  allowPrivateSourceUrls: process.env.ALLOW_PRIVATE_SOURCE_URLS === 'true', // tests only
+
+  // ---- Creator Studio: publishing through Zernio (empty key = social tools disabled) ----
+  zernioKey: process.env.ZERNIO_API_KEY || '',
+  zernioBaseUrl: (process.env.ZERNIO_BASE_URL || 'https://zernio.com/api/v1').replace(/\/$/, ''),
+  socialRedirectUrl: process.env.SOCIAL_REDIRECT_URL || '', // where users land after connecting an account
+  socialPlatforms: list('SOCIAL_PLATFORMS', 'youtube,tiktok,instagram,facebook,linkedin,pinterest,threads'),
+  limitPostsPerDay: int('LIMIT_POSTS_PER_DAY', 10),
+  socialPostFeeUsd: num('SOCIAL_POST_FEE_USD', 0), // charged per published post (pass your Zernio cost on)
 
   // LibreChat rejects MCP images above 10 MB (MCP_IMAGE_DATA_MAX_BYTES); stay safely below.
   previewMaxBytes: int('PREVIEW_MAX_BYTES', 8 * 1024 * 1024),

@@ -7,7 +7,8 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { start, seen, startLitellm, customers, litellmSeen } from './mock-openrouter.js';
+import { execFileSync } from 'node:child_process';
+import { start, seen, startLitellm, customers, litellmSeen, startZernio, zernio, zernioSeen, sttSeen } from './mock-openrouter.js';
 
 const MOCK_PORT = 4555;
 const MCP_PORT = 3499;
@@ -15,6 +16,8 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ormcp-'));
 const LL_PORT = 4556;
 const mock = await start(MOCK_PORT);
 const llMock = await startLitellm(LL_PORT);
+const ZN_PORT = 4557;
+const znMock = await startZernio(ZN_PORT);
 // two paying users with plenty of credit, a free user, and a nearly empty one
 customers.set('user-A', { spend: 1, max_budget: 100 });
 customers.set('user-B', { spend: 0, max_budget: 100 });
@@ -23,6 +26,8 @@ customers.set('user-C', { spend: 0, max_budget: 0.25 });
 customers.set('user-V', { spend: 0, max_budget: 10 });
 customers.set('user-BLOCKED', { spend: 0, max_budget: 100, blocked: true });
 
+fs.mkdirSync(path.join(tmp, 'music'), { recursive: true });
+execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=220:duration=4', '-c:a', 'libmp3lame', path.join(tmp, 'music', 'calm-1.mp3')]);
 const proc = spawn(process.execPath, ['src/index.js'], {
   env: {
     ...process.env,
@@ -44,6 +49,18 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     COST_MARKUP: '1.5',
     ESTIMATE_IMAGE_USD: '0.08',
     ESTIMATE_VIDEO_USD_PER_SECOND: '0.08',
+    ZERNIO_API_KEY: 'zn-key',
+    ZERNIO_BASE_URL: `http://127.0.0.1:${ZN_PORT}`,
+    SOCIAL_REDIRECT_URL: 'https://velorafy.example/back',
+    SOCIAL_POST_FEE_USD: '0.02',
+    LIMIT_SHORTS_PER_DAY: '5',
+    MAX_SHORT_SECONDS: '30',
+    MUSIC_DIR: path.join(tmp, 'music'),
+    ALLOW_PRIVATE_SOURCE_URLS: 'true', // the test serves the long video from 127.0.0.1
+    LIMIT_SOURCE_MINUTES_PER_DAY: '1',
+    LIMIT_CLIPS_PER_DAY: '3',
+    MAX_CLIPS_PER_CALL: '2',
+    SOURCE_WAIT_SECONDS: '60',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -75,7 +92,10 @@ try {
 
   const client = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-A' });
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ['check_video_status', 'generate_image', 'generate_speech', 'generate_video', 'list_media_models']);
+  assert.deepEqual(tools, [
+    'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_video_transcript', 'list_media_models',
+    'social_connect_account', 'social_list_accounts', 'social_publish', 'transcribe_video',
+  ]);
   ok('tools listed: ' + tools.join(', '));
 
   // 2. image
@@ -254,6 +274,228 @@ try {
   assert.ok(!r.isError, JSON.stringify(r));
   ok('after billing raises max_budget the same user can generate');
 
+
+  // ================= Creator Studio =================
+  const sC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-S' });
+  customers.set('user-S', { spend: 0, max_budget: 10 });
+  const sceneUrls = [];
+  for (let i = 0; i < 3; i++) {
+    r = await sC.callTool({ name: 'generate_image', arguments: { prompt: 'scene ' + i, aspect_ratio: '9:16' } });
+    assert.ok(!r.isError, JSON.stringify(r));
+    sceneUrls.push(r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.png/)[0]);
+  }
+  // a REAL 5.5 s mp3 voiceover placed in the media dir (the mock TTS returns fake bytes)
+  const voiceName = 'a'.repeat(32) + '.mp3';
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=5.5', '-c:a', 'libmp3lame', path.join(tmp, 'media', voiceName)]);
+  const voiceUrl = `http://127.0.0.1:${MCP_PORT}/media/${voiceName}`;
+
+  r = await sC.callTool({
+    name: 'assemble_short',
+    arguments: {
+      scenes: [
+        { media_url: sceneUrls[0], seconds: 2, caption: 'Kosmosda 3 sirr 🚀' },
+        { media_url: sceneUrls[1], seconds: 1.5, caption: 'Ərəb, Türk, English — any language: ə ğ ş ç' },
+        { media_url: sceneUrls[2], seconds: 1 },
+      ],
+      voiceover_url: voiceUrl,
+    },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const shortUrl = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp4/)[0];
+  assert.ok(r.content.some((c) => c.type === 'resource' && c.resource.text.includes('<video')));
+  const shortFile = path.join(tmp, 'media', shortUrl.split('/').pop());
+  const probe = JSON.parse(
+    execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json', shortFile]).toString(),
+  );
+  const vs = probe.streams.find((x) => x.codec_type === 'video');
+  assert.deepEqual([vs.width, vs.height], [1080, 1920]);
+  assert.ok(probe.streams.some((x) => x.codec_type === 'audio'), 'has audio track');
+  const dur = Number(probe.format.duration);
+  assert.ok(dur >= 5.5 && dur < 6.3, 'last scene stretched to cover the 5.5 s voiceover, got ' + dur);
+  const stt = sttSeen.at(-1);
+  assert.equal(stt.model, 'openai/whisper-large-v3');
+  assert.deepEqual(stt.granularities, ['word', 'segment']);
+  assert.ok(stt.bytes > 1000 && stt.format === 'mp3');
+  ok(`assemble_short -> 1080x1920 H.264+AAC, ${dur.toFixed(2)}s (scenes 4.5s, stretched to voiceover), word captions from STT`);
+
+  const sttBefore = sttSeen.length;
+  r = await sC.callTool({
+    name: 'assemble_short',
+    arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 3, caption: 'hi' }], voiceover_url: voiceUrl, caption_style: 'scene', music: 'calm', title: 'Hook', motion: false },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.equal(sttSeen.length, sttBefore, 'scene captions do not call STT');
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 2 }], music: 'disco' } });
+  assert.ok(r.isError && /calm-1/.test(r.content[0].text), 'unknown music lists available tracks');
+  ok('assemble_short: music by mood prefix (ducked), title, static mode; unknown track rejected with the list');
+
+  // no credit left -> the video is still built, but word captions (paid STT) are skipped
+  customers.set('user-S', { spend: 10, max_budget: 10 });
+  const sttBeforeBroke = sttSeen.length;
+  r = await sC.callTool({
+    name: 'assemble_short',
+    arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 3, caption: 'hi' }], voiceover_url: voiceUrl },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.equal(sttSeen.length, sttBeforeBroke, 'no STT call without credit');
+  assert.match(r.content[0].text, /need credit/);
+  customers.set('user-S', { spend: 0, max_budget: 10 });
+  ok('assemble_short: without credit, word captions (paid STT) are skipped and the video is still built');
+
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 2 }] } });
+  assert.ok(!r.isError, 'works without voiceover (silent track)');
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: 'https://evil.example/x.png', seconds: 2 }] } });
+  assert.ok(r.isError && /created by this server/.test(r.content[0].text));
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0].replace(/[a-f0-9]{32}/, '../../etc/passwd'), seconds: 2 }] } });
+  assert.ok(r.isError);
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 2 }], voiceover_url: sceneUrls[1] } });
+  assert.ok(r.isError && /audio link/.test(r.content[0].text));
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: Array(2).fill({ media_url: sceneUrls[0], seconds: 20 }) } });
+  assert.ok(r.isError && /at most 30s/.test(r.content[0].text), JSON.stringify(r));
+  ok('assemble_short rejects foreign URLs, path tricks, non-audio voiceover and over-length videos');
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 1 }] } });
+  assert.ok(!r.isError);
+  r = await sC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: sceneUrls[0], seconds: 1 }] } });
+  assert.ok(r.isError && /Daily short video limit/.test(r.content[0].text), JSON.stringify(r));
+  ok('daily short-video limit enforced (5)');
+
+
+  // ---- long video -> clips ----
+  const srcName = 'b'.repeat(32) + '.mp4';
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:d=40', '-f', 'lavfi', '-i', 'sine=frequency=300:duration=40',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', path.join(tmp, 'media', srcName)]);
+  const srcUrl = `http://127.0.0.1:${MCP_PORT}/media/${srcName}`;
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: 'https://www.youtube.com/watch?v=abc' } });
+  assert.ok(r.isError && /cannot be downloaded/.test(r.content[0].text));
+  const mediaBefore = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: srcUrl, language: 'en' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const sourceId = r.content[0].text.match(/source_id: ([a-f0-9]{24})/)[1];
+  assert.ok(/\[0:00-0:0\d\] This is the best part/.test(r.content[0].text), r.content[0].text.slice(0, 400));
+  const mediaAfter = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  assert.ok(Math.abs(mediaAfter - mediaBefore - 0.01 * 1 * 1.5) < 1e-9, `charged 1 min x $0.01 x 1.5, got ${mediaAfter - mediaBefore}`);
+  ok('transcribe_video: downloads, transcribes with timestamps, charges per minute with markup; refuses YouTube page links');
+
+  const otherC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-B' });
+  r = await otherC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 0, end: 10 }] } });
+  assert.ok(r.isError && /Unknown source_id/.test(r.content[0].text));
+  r = await sC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 0, end: 3 }] } });
+  assert.ok(r.isError && /5-30s/.test(r.content[0].text));
+  ok("cut_clips: other users cannot use someone else's source; length limits enforced");
+
+  r = await sC.callTool({
+    name: 'cut_clips',
+    arguments: { source_id: sourceId, framing: 'fit', clips: [{ start: 2, end: 9, title: 'Best part' }, { start: 20, end: 27.5 }] },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const clipUrls = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp4/g);
+  assert.equal(clipUrls.length, 2);
+  for (const [i, u] of clipUrls.entries()) {
+    const pr = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json',
+      path.join(tmp, 'media', u.split('/').pop())]).toString());
+    const v = pr.streams.find((x) => x.codec_type === 'video');
+    assert.deepEqual([v.width, v.height], [1080, 1920]);
+    const d = Number(pr.format.duration);
+    assert.ok(Math.abs(d - [7, 7.5][i]) < 0.25, 'clip length ' + d);
+  }
+  r = await sC.callTool({ name: 'cut_clips', arguments: { source_id: sourceId, clips: [{ start: 10, end: 16 }, { start: 30, end: 36 }] } });
+  assert.ok(r.isError && /Daily clip limit/.test(r.content[0].text), JSON.stringify(r));
+  r = await sC.callTool({ name: 'get_video_transcript', arguments: { source_id: sourceId } });
+  assert.ok(!r.isError && r.content[0].text.includes(sourceId));
+  r = await sC.callTool({ name: 'transcribe_video', arguments: { url: srcUrl } });
+  assert.ok(r.isError && /video-minutes limit/.test(r.content[0].text), JSON.stringify(r));
+  ok('cut_clips -> vertical 1080x1920 clips (fit framing, title, word captions); daily clip + minutes limits enforced');
+
+  // ---- social publishing ----
+  r = await sC.callTool({ name: 'social_connect_account', arguments: { platform: 'youtube' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.ok(r.content[0].text.includes('https://auth.example/youtube?p=prof_1'));
+  const conn = zernioSeen.findLast((x) => x.path.startsWith('/connect/'));
+  assert.equal(conn.query.redirect_url, 'https://velorafy.example/back');
+  assert.equal(zernio.profiles[0].externalId, 'user-S');
+  ok('social_connect_account creates one profile per user (externalId) and returns the OAuth link');
+
+  // the user finishes OAuth: accounts appear in their profile; another user owns a different account
+  zernio.accounts.push({ _id: 'acc_yt_S', platform: 'youtube', username: 'spacefacts', isActive: true, profileId: 'prof_1' });
+  zernio.accounts.push({ _id: 'acc_tt_S', platform: 'tiktok', username: 'spacefacts', isActive: true, profileId: 'prof_1' });
+  const oC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-O' });
+  r = await oC.callTool({ name: 'social_list_accounts', arguments: {} });
+  assert.ok(/No accounts connected/.test(r.content[0].text));
+  zernio.accounts.push({ _id: 'acc_yt_O', platform: 'youtube', username: 'other', isActive: true, profileId: 'prof_2' });
+
+  r = await sC.callTool({ name: 'social_list_accounts', arguments: {} });
+  const accs = JSON.parse(r.content[0].text);
+  assert.deepEqual(accs.map((a) => a.account_id).sort(), ['acc_tt_S', 'acc_yt_S']);
+  const profileCalls = zernioSeen.filter((x) => x.method === 'POST' && x.path === '/profiles').length;
+  assert.equal(profileCalls, 2, 'profile is created once per user and then cached');
+  ok("social_list_accounts shows only the user's own accounts");
+
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'x', targets: [{ account_id: 'acc_yt_O' }], mode: 'now' },
+  });
+  assert.ok(r.isError && /not connected to this user/.test(r.content[0].text));
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: ['https://evil.example/a.mp4'], caption: 'x', targets: [{ account_id: 'acc_yt_S' }], mode: 'now' },
+  });
+  assert.ok(r.isError && /Only media created by this server/.test(r.content[0].text));
+  assert.ok(!zernioSeen.some((x) => x.path === '/posts'), 'nothing was posted');
+  ok("social_publish refuses another user's account and foreign media before calling Zernio");
+
+  const spendBefore = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: {
+      media_urls: [shortUrl],
+      caption: '3 space secrets\n#space #shorts',
+      targets: [{ account_id: 'acc_yt_S', youtube_title: '3 Space Secrets' }, { account_id: 'acc_tt_S' }],
+      mode: 'now',
+    },
+  });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const posted = zernioSeen.findLast((x) => x.path === '/posts');
+  assert.equal(posted.body.publishNow, true);
+  assert.equal(posted.body.profileId, 'prof_1');
+  assert.deepEqual(posted.body.mediaItems, [{ url: shortUrl }]);
+  assert.deepEqual(posted.body.platforms, [
+    { platform: 'youtube', accountId: 'acc_yt_S', platformSpecificData: { title: '3 Space Secrets' } },
+    { platform: 'tiktok', accountId: 'acc_tt_S' },
+  ]);
+  assert.ok(posted.idem && posted.idem.length >= 32, 'Idempotency-Key sent');
+  const spendAfter = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  assert.ok(Math.abs(spendAfter - spendBefore - 0.02 * 2 * 1.5) < 1e-9, 'fee 0.02 x 2 accounts x markup 1.5');
+  ok('social_publish now: correct Zernio body (platform from account, YouTube title, idempotency) + per-account fee charged');
+
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'acc_tt_S' }], mode: 'schedule' },
+  });
+  assert.ok(r.isError && /scheduled_for is required/.test(r.content[0].text));
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'later', targets: [{ account_id: 'acc_tt_S' }], mode: 'schedule', scheduled_for: '2026-12-01T18:00:00', timezone: 'America/New_York' },
+  });
+  assert.ok(!r.isError);
+  const sched = zernioSeen.findLast((x) => x.path === '/posts').body;
+  assert.deepEqual([sched.scheduledFor, sched.timezone, sched.publishNow], ['2026-12-01T18:00:00', 'America/New_York', undefined]);
+  ok('social_publish schedule passes scheduledFor + timezone');
+
+  const s1 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  r = await sC.callTool({
+    name: 'social_publish',
+    arguments: { media_urls: [shortUrl], caption: 'FAILALL', targets: [{ account_id: 'acc_tt_S' }], mode: 'now' },
+  });
+  assert.ok(r.isError && /FAILED/.test(r.content[0].text) && /too long/.test(r.content[0].text));
+  const s2 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
+  assert.equal(s2, s1, 'a fully failed post is not charged');
+  ok('HTTP 207 total failure is reported as an error and not charged');
+
+  const anonC = await connect({ 'x-api-key': 'sekret' });
+  r = await anonC.callTool({ name: 'social_list_accounts', arguments: {} });
+  assert.ok(r.isError && /signed-in user/.test(r.content[0].text));
+  ok('social tools refuse requests without a user id');
+
   await client.close();
   await clientB.close();
   console.log(`\nALL ${passed} CHECKS PASSED`);
@@ -265,4 +507,5 @@ try {
   proc.kill();
   mock.close();
   llMock.close();
+  znMock.close();
 }
