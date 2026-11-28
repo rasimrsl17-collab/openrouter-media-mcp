@@ -97,6 +97,16 @@ export const config = {
   sourceWaitSeconds: int('SOURCE_WAIT_SECONDS', 200),
   allowPrivateSourceUrls: process.env.ALLOW_PRIVATE_SOURCE_URLS === 'true', // tests only
 
+  // ---- music generation (OpenRouter audio-output models, e.g. Google Lyria 3) ----
+  // first = 30 s clips, second = full songs; empty list disables generate_music
+  musicModels: list('ALLOWED_MUSIC_MODELS', 'google/lyria-3-clip-preview,google/lyria-3-pro-preview'),
+  limitMusicPerDay: int('LIMIT_MUSIC_PER_DAY', 10),
+  estimateMusicUsd: num('ESTIMATE_MUSIC_USD', 0.08), // per track; Lyria clip $0.04, full song $0.08
+
+  // ---- import_media: the user's own images / audio / video from a link ----
+  limitImportsPerDay: int('LIMIT_IMPORTS_PER_DAY', 30), // 0 disables import_media
+  maxImportMb: int('MAX_IMPORT_MB', 300),
+
   // ---- Creator Studio: long horizontal videos (assemble_long) + thumbnails ----
   limitLongVideosPerDay: int('LIMIT_LONG_VIDEOS_PER_DAY', 2), // 0 disables assemble_long
   maxLongMinutes: int('MAX_LONG_MINUTES', 20),

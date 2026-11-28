@@ -13,6 +13,8 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import express from 'express';
 import sharp from 'sharp';
 import { z } from 'zod';
@@ -34,11 +36,12 @@ import {
   addMediaSpend,
   localMediaPath,
 } from './storage.js';
-import { renderShort, renderClip, kindOf, listMusic, pickMusic, StudioError } from './studio.js';
+import { renderShort, renderClip, kindOf, listMusic, pickMusic, StudioError, run as runProc } from './studio.js';
 import * as clips from './clips.js';
 import { transcribeVoice } from './clips.js';
 import * as social from './social.js';
 import * as longform from './longform.js';
+import { importMedia } from './imports.js';
 
 const PCM_ONLY_PREFIXES = ['google/gemini', 'heygen/']; // per OpenRouter TTS docs: these return only pcm
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'expired']);
@@ -110,6 +113,23 @@ async function toPreview(bytes, mediaType) {
     quality -= 12;
   } while (out.length > config.previewMaxBytes && quality > 30);
   return { bytes: out, mimeType: 'image/jpeg' };
+}
+
+/** Convert wav / raw pcm16 (48 kHz stereo, Lyria's native rate) to mp3 with ffmpeg. */
+async function toMp3(bytes, format) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'music-'));
+  try {
+    const isWav = bytes.subarray(0, 4).toString('latin1') === 'RIFF';
+    const inFile = path.join(dir, isWav ? 'in.wav' : 'in.raw');
+    fs.writeFileSync(inFile, bytes);
+    const raw = !isWav && (!format || /pcm/i.test(format));
+    const pre = raw ? ['-f', 's16le', '-ar', '48000', '-ac', '2'] : [];
+    const out = path.join(dir, 'out.mp3');
+    await runProc(config.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-y', ...pre, '-i', inFile, '-c:a', 'libmp3lame', '-b:a', '192k', out], 120_000);
+    return fs.readFileSync(out);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---------- video model capabilities (GET /videos/models, cached 1h) -------------
@@ -503,6 +523,123 @@ function buildServer(userId) {
     );
   }
 
+  // ----- the user's own files -----
+  if (config.limitImportsPerDay > 0) {
+    server.registerTool(
+      'import_media',
+      {
+        title: "Import the user's own file",
+        description:
+          "Bring the user's OWN image, audio (e.g. their own voice recording or music) or video into the studio from a link, " +
+          'so it can be used in assemble_short, assemble_long, make_thumbnail or social_publish. ' +
+          'Accepts direct https links, Google Drive share links ("Anyone with the link") and Dropbox links; files attached ' +
+          `in the chat cannot be read, so ask the user for a link. Max ${config.maxImportMb} MB. ` +
+          'YouTube/TikTok/Instagram page links are not supported. The user must own the file or have the right to use it. Free.',
+        inputSchema: { url: z.string().url().describe('Link to the file') },
+      },
+      async ({ url }) => {
+        if (userId === 'anonymous') return fail('Importing needs a signed-in user. Ask the user to sign in again.');
+        const q = checkQuota(userId, 'import', 1);
+        if (!q.ok) return quotaError('import', q);
+        let r;
+        try {
+          r = await importMedia(url);
+        } catch (err) {
+          if (err instanceof clips.SourceError || err instanceof StudioError) return fail(err.message);
+          console.error('[import_media]', err);
+          return fail(`Could not import the file: ${err?.message || err}`);
+        }
+        consumeQuota(userId, 'import', 1);
+        logUsage({ kind: 'import', userId, mediaKind: r.kind, seconds: r.seconds });
+        if (!r.url) return fail('PUBLIC_BASE_URL is not configured, so the file cannot be used.');
+        const size = r.width ? `, ${r.width}x${r.height}` : '';
+        const len = r.seconds ? `, ${r.seconds.toFixed(1)}s` : '';
+        const content = [text(`Imported the user's ${r.kind}${size}${len}. Use this exact link in other tools: ${r.url}`)];
+        if (r.kind === 'image') {
+          const bytes = fs.readFileSync(localMediaPath(r.url));
+          const preview = await toPreview(bytes, r.fileName.endsWith('.png') ? 'image/png' : 'image/jpeg');
+          content.push({ type: 'image', data: preview.bytes.toString('base64'), mimeType: preview.mimeType });
+          content[0].text += ' The image is already displayed to the user.';
+        } else {
+          content[0].text += ' Show it by placing the UI Resource Marker given below in your reply.';
+          content.push(playerResource(r.kind, r.fileName.split('.')[0], r.url, r.kind === 'video' ? 'video/mp4' : 'audio/mpeg'));
+        }
+        return { content };
+      },
+    );
+  }
+
+  // ----- music -----
+  if (config.musicModels.length && config.limitMusicPerDay > 0) {
+    server.registerTool(
+      'generate_music',
+      {
+        title: 'Generate music',
+        description:
+          'Create original music (MP3) from a description: background music for videos, jingles, or full songs with vocals. ' +
+          `length "clip" = about 30 s (${config.musicModels[0]})` +
+          (config.musicModels[1] ? `, "song" = a full-length song (${config.musicModels[1]})` : '') +
+          '. Describe genre, mood, instruments and tempo in English; for vocals give the lyrics (any language). ' +
+          'Never ask for a named artist, band or copyrighted song. The result can be used as music_url in assemble_short, ' +
+          'assemble_long or cut_clips (it loops and ducks under the voice).',
+        inputSchema: {
+          prompt: z.string().min(3).max(1500).describe('Genre, mood, instruments, tempo, e.g. "calm lo-fi piano, soft rain, 80 bpm"'),
+          length: z.enum(['clip', 'song']).optional().describe('clip = ~30 s (default, cheaper), song = full length'),
+          instrumental: z.boolean().optional().describe('No vocals (default true unless lyrics are given)'),
+          lyrics: z.string().max(3000).optional().describe('Song lyrics for vocals'),
+        },
+      },
+      async (args) => {
+        const model = args.length === 'song' && config.musicModels[1] ? config.musicModels[1] : config.musicModels[0];
+        const q = checkQuota(userId, 'music', 1);
+        if (!q.ok) return quotaError('music', q);
+        const hold = await reserve(userId, config.estimateMusicUsd);
+        if (!hold.ok) return fail(hold.message);
+        try {
+          const instrumental = args.instrumental ?? !args.lyrics;
+          let prompt = args.prompt.trim();
+          if (instrumental) prompt += '\nInstrumental only, no vocals.';
+          else if (args.lyrics) prompt += `\nLyrics:\n${args.lyrics.trim()}`;
+          let r;
+          try {
+            r = await or.generateMusic({ model, prompt });
+          } catch (err) {
+            return orError(err);
+          }
+          if (r.bytes.length < 1000) return fail('The music model returned no audio. Try a different description.');
+          let bytes = r.bytes;
+          const isMp3 = (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0);
+          if (!isMp3) {
+            try {
+              bytes = await toMp3(bytes, r.format);
+            } catch (err) {
+              console.error('[generate_music convert]', err?.message || err);
+              return fail('The music came back in a format this server could not convert.');
+            }
+          }
+          const saved = saveMedia(bytes, 'audio/mpeg');
+          if (!saved.url) return fail('PUBLIC_BASE_URL is not configured, so the audio cannot be shown.');
+          consumeQuota(userId, 'music', 1);
+          const cost = typeof r.cost === 'number' && r.cost > 0 ? r.cost : config.estimateMusicUsd;
+          const charged = cost * config.costMarkup;
+          addMediaSpend(userId, charged);
+          logUsage({ kind: 'music', userId, model, cost: r.cost, charged });
+          return {
+            content: [
+              text(
+                'Music is ready. Show the player by placing the UI Resource Marker given below in your reply, and give the ' +
+                  `download link. To use it under a video pass this exact link as music_url: ${saved.url}`,
+              ),
+              playerResource('audio', saved.fileName.split('.')[0], saved.url, 'audio/mpeg'),
+            ],
+          };
+        } finally {
+          hold.release();
+        }
+      },
+    );
+  }
+
   // ----- Creator Studio: assemble a vertical short -----
   if (config.limitShortsPerDay > 0) {
     server.registerTool(
@@ -536,6 +673,7 @@ function buildServer(userId) {
           title: z.string().max(60).optional().describe('Optional hook text pinned at the top, e.g. "3 facts nobody tells you"'),
           motion: z.boolean().optional().describe('Animate still images with zoom/pan (default true)'),
           music: z.string().max(60).optional().describe('Background music track name or mood prefix (see description); omit for none'),
+          music_url: z.string().url().optional().describe('Or: a /media/ mp3 link from generate_music to use as background music'),
           language: z.string().max(5).optional().describe('ISO code of the voiceover language (e.g. en, tr, es) for better word captions'),
         },
       },
@@ -559,7 +697,10 @@ function buildServer(userId) {
           }
         }
         let musicFile;
-        if (args.music) {
+        if (args.music_url) {
+          musicFile = localMediaPath(args.music_url);
+          if (!musicFile || kindOf(musicFile) !== 'audio') return fail('music_url must be an audio link created by generate_music (…/media/….mp3).');
+        } else if (args.music) {
           const t = pickMusic(args.music);
           if (!t) {
             const names = listMusic().map((x) => x.name);
@@ -672,6 +813,7 @@ function buildServer(userId) {
           language: z.string().max(5).optional().describe('ISO code of the voiceover language (e.g. az, en, tr) for better subtitles'),
           motion: z.boolean().optional().describe('Slow zoom/pan on still images (default true)'),
           music: z.string().max(60).optional().describe('Background music track name or mood prefix (see description); omit for none'),
+          music_url: z.string().url().optional().describe('Or: a /media/ mp3 link from generate_music to use as background music'),
         },
       },
       async (args) => {
@@ -700,7 +842,10 @@ function buildServer(userId) {
           sections.push({ voiceFile, items, heading: sec.heading });
         }
         let musicFile;
-        if (args.music) {
+        if (args.music_url) {
+          musicFile = localMediaPath(args.music_url);
+          if (!musicFile || kindOf(musicFile) !== 'audio') return fail('music_url must be an audio link created by generate_music (…/media/….mp3).');
+        } else if (args.music) {
           const t = pickMusic(args.music);
           if (!t) {
             const names = listMusic().map((x) => x.name);
@@ -925,6 +1070,7 @@ function buildServer(userId) {
           framing: z.enum(['center', 'fit']).optional(),
           captions: z.boolean().optional().describe('Word-by-word captions (default true)'),
           music: z.string().max(60).optional().describe('Optional background music track name or mood prefix'),
+          music_url: z.string().url().optional().describe('Or: a /media/ mp3 link from generate_music to use as background music'),
         },
       },
       async (args) => {
@@ -942,7 +1088,10 @@ function buildServer(userId) {
         const q = checkQuota(userId, 'clip', args.clips.length);
         if (!q.ok) return quotaError('clip', q);
         let musicFile;
-        if (args.music) {
+        if (args.music_url) {
+          musicFile = localMediaPath(args.music_url);
+          if (!musicFile || kindOf(musicFile) !== 'audio') return fail('music_url must be an audio link created by generate_music (…/media/….mp3).');
+        } else if (args.music) {
           const t = pickMusic(args.music);
           if (!t) return fail(`No music track matches "${args.music}".`);
           musicFile = t.file;
@@ -1150,6 +1299,48 @@ function buildServer(userId) {
           const head =
             st.status === 'scheduled' ? `Scheduled for ${st.scheduledAt} (UTC), not published yet.` : st.status === 'draft' ? 'Draft (not published).' : `Status: ${st.status}.`;
           return { content: [text(`${head}\n${describeResults(st)}`.trim())] };
+        } catch (err) {
+          return socialFail(err);
+        }
+      },
+    );
+    server.registerTool(
+      'social_list_scheduled',
+      {
+        title: 'List scheduled posts',
+        description: "List the user's scheduled posts and drafts that are not published yet (to review or cancel them).",
+        inputSchema: {},
+      },
+      async () => {
+        if (userId === 'anonymous') return anon();
+        try {
+          const rows = await social.listPending(userId);
+          if (!rows.length) return { content: [text('No scheduled posts or drafts.')] };
+          return { content: [text(JSON.stringify(rows, null, 1) + '\nTimes are UTC; convert to the user\'s time zone when you show them.')] };
+        } catch (err) {
+          return socialFail(err);
+        }
+      },
+    );
+
+    server.registerTool(
+      'social_cancel_post',
+      {
+        title: 'Cancel a scheduled post',
+        description:
+          'Cancel a scheduled post or delete a draft so it is never published. Only after the user clearly asked to cancel THIS ' +
+          'post (show its time and platforms first). Already published posts cannot be removed here. To change a scheduled ' +
+          'post, cancel it and publish again with social_publish.',
+        inputSchema: { post_id: z.string().min(1).describe('From social_list_scheduled or social_publish') },
+      },
+      async ({ post_id }) => {
+        if (userId === 'anonymous') return anon();
+        try {
+          const r = await social.cancelPost(userId, post_id);
+          logUsage({ kind: 'post-cancel', userId, postId: post_id });
+          return {
+            content: [text(r.wasStatus === 'draft' ? `Draft ${post_id} deleted.` : `Scheduled post ${post_id} (${r.scheduledAt} UTC) cancelled; it will not be published.`)],
+          };
         } catch (err) {
           return socialFail(err);
         }

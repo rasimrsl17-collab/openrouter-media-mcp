@@ -134,3 +134,69 @@ export async function transcribe({ bytes, format, language }) {
   if (!res.ok) throw await readError(res);
   return res.json();
 }
+
+/**
+ * Music (Google Lyria 3 and other audio-output chat models).
+ * POST /chat/completions { model, messages, modalities: ['text','audio'], audio: { format }, stream: true }
+ * Audio arrives in SSE chunks as choices[0].delta.audio.data (base64); usage.cost in the last chunk.
+ * A non-streamed JSON answer (message.audio.data) is accepted too.
+ */
+export async function generateMusic({ model, prompt, format = 'mp3' }) {
+  const res = await fetch(`${config.openrouterBaseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: headers(true),
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], modalities: ['text', 'audio'], audio: { format }, stream: true, usage: { include: true } }),
+    signal: AbortSignal.timeout(280_000),
+  });
+  if (!res.ok) throw await readError(res);
+  const parts = [];
+  let transcript = '';
+  let cost = null;
+  let fmt = null;
+  const take = (obj) => {
+    if (obj?.error) throw new OpenRouterError(502, obj.error.message || JSON.stringify(obj.error), obj);
+    const ch = obj?.choices?.[0];
+    const a = ch?.delta?.audio || ch?.message?.audio;
+    if (a?.data) parts.push(a.data);
+    if (a?.format) fmt = a.format;
+    if (a?.transcript) transcript += a.transcript;
+    if (typeof obj?.usage?.cost === 'number') cost = obj.usage.cost;
+  };
+  if (!(res.headers.get('content-type') || '').includes('event-stream')) {
+    take(await res.json());
+  } else {
+    const decoder = new TextDecoder();
+    let buf = '';
+    for await (const chunk of res.body) {
+      buf += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        let obj;
+        try {
+          obj = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        take(obj);
+      }
+    }
+  }
+  // chunks may be split anywhere (not 4-aligned) or padded one by one: decode at 4-char boundaries
+  const out = [];
+  let acc = '';
+  for (const p of parts) {
+    acc += String(p).replace(/\s/g, '');
+    if (acc.length % 4 === 0) {
+      out.push(Buffer.from(acc, 'base64'));
+      acc = '';
+    }
+  }
+  if (acc) out.push(Buffer.from(acc, 'base64'));
+  const bytes = Buffer.concat(out);
+  return { bytes, format: fmt, transcript: transcript.trim(), cost };
+}

@@ -40,6 +40,9 @@ LibreChat agentlərinə alət kimi verən MCP server.
 | `cut_clips` | Uzun videodan seçilmiş anları altyazılı vertikal kliplərə çevirir |
 | `assemble_long` | Bölmələr (hər biri: səsləndirmə + şəkillər) → 1920x1080 uzun YouTube videosu (20 dəq-yə qədər), altyazı, fəsil başlıqları, musiqi; arxa planda render |
 | `get_long_video` | `assemble_long` işinin vəziyyəti / hazır video |
+| `generate_music` | Orijinal musiqi (Google Lyria 3): ~30 s fon musiqisi ($0.04) və ya sözlü tam mahnı ($0.08); videoda `music_url` kimi |
+| `import_media` | İstifadəçinin öz şəkli/səsi/videosu linkdən (Drive, Dropbox, birbaşa) studiyaya gətirilir |
+| `social_list_scheduled` / `social_cancel_post` | Planlı postlar və qaralamalar; dərc olunmamış postu ləğv etmək |
 | `make_thumbnail` | Şəkil → 1280x720 YouTube thumbnail-i, iri konturlu yazı, `*söz*` rəngli vurğu |
 | `social_connect_account` | İstifadəçiyə öz YouTube/TikTok/Instagram… hesabını qoşmaq üçün link (Post for Me OAuth) |
 | `social_list_accounts` | İstifadəçinin YALNIZ öz qoşulmuş hesabları |
@@ -112,6 +115,17 @@ Agentin təlimatı: [`deploy/creator-agent-prompt.md`](deploy/creator-agent-prom
 - Thumbnail Post for Me ilə avtomatik qoyulmur — istifadəçi onu YouTube Studio-da əl ilə seçir.
 - Eyni üslub: `generate_image`-də ilk yaxşı şəklin /media/ linkini `reference_image_urls`-ə vermək olar
   (yalnız istinad şəkil qəbul edən modellərdə).
+
+**Musiqi (`generate_music`)**
+- OpenRouter `/chat/completions` + `modalities: ["text","audio"]` (stream). `ALLOWED_MUSIC_MODELS`: birinci = 30 s klip,
+  ikinci = tam mahnı. WAV/PCM gəlsə ffmpeg ilə mp3-ə çevrilir. Real xərc × `COST_MARKUP` tutulur.
+- Videoda istifadə: `assemble_short` / `assemble_long` / `cut_clips` → `music_url`.
+
+**Öz faylları (`import_media`)** — şəkil yenidən kodlanır, səs mp3-ə, video mp4-ə köçürülür (`MAX_IMPORT_MB`, default 300).
+LibreChat-ə yüklənən fayllar MCP-yə çatmır, ona görə istifadəçi link verir.
+
+**Dublyaj** — studiyada yaradılmış videolar üçün agent ssenarini tərcümə edir, yeni dildə `generate_speech` edir və
+eyni şəkillərlə yenidən yığır (təlimatda iş axını var). Real çəkilişin səsini başqa dilə çevirmək (voice cloning) yoxdur.
 
 **Uzun video → kliplər (`transcribe_video`, `get_video_transcript`, `cut_clips`)**
 - İstifadəçi öz videosunun linkini verir (birbaşa https, Google Drive "Anyone with the link", Dropbox).

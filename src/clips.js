@@ -127,7 +127,7 @@ export function directUrl(raw) {
   return u.toString();
 }
 
-function download(url, file, redirectsLeft = 5) {
+export function download(url, file, redirectsLeft = 5, maxMb = config.maxSourceMb) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -145,30 +145,30 @@ function download(url, file, redirectsLeft = 5) {
         res.resume();
         if (!redirectsLeft) return reject(new SourceError('Too many redirects.'));
         const next = new URL(res.headers.location, u).toString();
-        return download(next, file, redirectsLeft - 1).then(resolve, reject);
+        return download(next, file, redirectsLeft - 1, maxMb).then(resolve, reject);
       }
       if (res.statusCode !== 200) {
         res.resume();
-        return reject(new SourceError(`The link answered HTTP ${res.statusCode}. Make sure it is public and points to the video file.`));
+        return reject(new SourceError(`The link answered HTTP ${res.statusCode}. Make sure it is public and points to the file itself.`));
       }
       const type = String(res.headers['content-type'] || '');
       if (/text\/html/i.test(type)) {
         res.resume();
         return reject(
-          new SourceError('The link opens a web page, not a video file. For Google Drive, set sharing to "Anyone with the link".'),
+          new SourceError('The link opens a web page, not a file. For Google Drive, set sharing to "Anyone with the link".'),
         );
       }
-      const max = config.maxSourceMb * 1024 * 1024;
+      const max = maxMb * 1024 * 1024;
       if (Number(res.headers['content-length']) > max) {
         res.resume();
-        return reject(new SourceError(`The file is larger than ${config.maxSourceMb} MB.`));
+        return reject(new SourceError(`The file is larger than ${maxMb} MB.`));
       }
       let got = 0;
       const out = fs.createWriteStream(file);
       res.on('data', (chunk) => {
         got += chunk.length;
         if (got > max) {
-          req.destroy(new SourceError(`The file is larger than ${config.maxSourceMb} MB.`));
+          req.destroy(new SourceError(`The file is larger than ${maxMb} MB.`));
         }
       });
       res.pipe(out);

@@ -104,6 +104,8 @@ const LIMITS = {
   clip: () => config.limitClipsPerDay,
   long: () => config.limitLongVideosPerDay,
   thumb: () => config.limitThumbnailsPerDay,
+  music: () => config.limitMusicPerDay,
+  import: () => config.limitImportsPerDay,
 };
 
 /** Path of a file this server saved, from its public /media URL; null for anything else. */

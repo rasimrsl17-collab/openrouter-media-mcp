@@ -156,6 +156,7 @@ export async function publish(userId, { mediaUrls, caption, targets, mode, sched
   const isVideo = mediaUrls.some((u) => /\.(mp4|mov|webm)$/i.test(u));
   const body = {
     caption,
+    external_id: tag(userId), // lets social_list_scheduled find this user's posts
     social_accounts: targets.map((t) => t.account_id),
     media: mediaUrls.map((url) => ({ url })),
     account_configurations: targets.map((t) => ({
@@ -177,13 +178,43 @@ export async function publish(userId, { mediaUrls, caption, targets, mode, sched
   };
 }
 
-/** Per-account outcome of a post that belongs to this user. */
-export async function postStatus(userId, postId) {
+async function ownedPost(userId, postId) {
   const post = await call('GET', `/social-posts/${encodeURIComponent(postId)}`);
   const accounts = post?.social_accounts || [];
-  if (!accounts.length || accounts.some((a) => a.external_id !== tag(userId))) {
-    throw new SocialError('Unknown post_id.', 404);
+  if (!accounts.length || accounts.some((a) => a.external_id !== tag(userId))) throw new SocialError('Unknown post_id.', 404);
+  return post;
+}
+
+/** This user's scheduled posts and drafts (newest first). */
+export async function listPending(userId) {
+  const q = `external_id=${encodeURIComponent(tag(userId))}&status=scheduled&status=draft&limit=50`;
+  const r = await call('GET', `/social-posts?${q}`);
+  return (r?.data || [])
+    .filter((p) => (p.social_accounts || []).length && p.social_accounts.every((a) => a.external_id === tag(userId)))
+    .filter((p) => p.status === 'scheduled' || p.status === 'draft')
+    .map((p) => ({
+      post_id: p.id,
+      status: p.status,
+      scheduled_at: p.scheduled_at ?? null,
+      caption: String(p.caption || '').slice(0, 120),
+      platforms: p.social_accounts.map((a) => `${a.platform}${a.username ? ' @' + a.username : ''}`),
+    }));
+}
+
+/** Cancel a scheduled post or delete a draft (published posts cannot be removed this way). */
+export async function cancelPost(userId, postId) {
+  const post = await ownedPost(userId, postId);
+  if (post.status !== 'scheduled' && post.status !== 'draft') {
+    throw new SocialError(`This post is already ${post.status}; only scheduled posts and drafts can be cancelled. Delete published posts on the platform itself.`, 400);
   }
+  await call('DELETE', `/social-posts/${encodeURIComponent(postId)}`);
+  return { postId, wasStatus: post.status, scheduledAt: post.scheduled_at ?? null };
+}
+
+/** Per-account outcome of a post that belongs to this user. */
+export async function postStatus(userId, postId) {
+  const post = await ownedPost(userId, postId);
+  const accounts = post.social_accounts;
   const byId = new Map(accounts.map((a) => [a.id, a]));
   const r = await call('GET', `/social-post-results?post_id=${encodeURIComponent(postId)}&limit=50`);
   const raw = r?.data || [];

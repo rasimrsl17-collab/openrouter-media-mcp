@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { execFileSync } from 'node:child_process';
-import { start, seen, startLitellm, customers, litellmSeen, startPostForMe, pfm, pfmSeen, sttSeen } from './mock-openrouter.js';
+import { start, seen, startLitellm, customers, litellmSeen, startPostForMe, pfm, pfmSeen, sttSeen, musicSeen } from './mock-openrouter.js';
 import sharp from 'sharp';
 const sharpMeta = (b) => sharp(b).metadata();
 
@@ -65,6 +65,9 @@ const proc = spawn(process.execPath, ['src/index.js'], {
     MAX_LONG_MINUTES: '1',
     LONG_WAIT_SECONDS: '120',
     LIMIT_THUMBNAILS_PER_DAY: '2',
+    LIMIT_MUSIC_PER_DAY: '2',
+    LIMIT_IMPORTS_PER_DAY: '4',
+    MAX_IMPORT_MB: '5',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -97,8 +100,9 @@ try {
   const client = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-A' });
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
-    'assemble_long', 'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_speech', 'generate_video', 'get_long_video',
-    'get_video_transcript', 'list_media_models', 'make_thumbnail', 'social_connect_account', 'social_list_accounts', 'social_post_status', 'social_publish', 'transcribe_video',
+    'assemble_long', 'assemble_short', 'check_video_status', 'cut_clips', 'generate_image', 'generate_music', 'generate_speech', 'generate_video',
+    'get_long_video', 'get_video_transcript', 'import_media', 'list_media_models', 'make_thumbnail', 'social_cancel_post', 'social_connect_account',
+    'social_list_accounts', 'social_list_scheduled', 'social_post_status', 'social_publish', 'transcribe_video',
   ]);
   ok('tools listed: ' + tools.join(', '));
 
@@ -424,6 +428,55 @@ try {
   assert.ok(r.isError, 'audio is not an image');
   ok('make_thumbnail -> 1280x720 JPEG < 2 MB with accent words; long text wraps; non-images rejected');
 
+  // ---- music + import_media ----
+  const mC = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-M' });
+  customers.set('user-M', { spend: 0, max_budget: 10 });
+  r = await mC.callTool({ name: 'generate_music', arguments: { prompt: 'calm lo-fi piano, 80 bpm' } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const ms = musicSeen.at(-1);
+  assert.equal(ms.model, 'google/lyria-3-clip-preview');
+  assert.deepEqual(ms.modalities, ['text', 'audio']);
+  assert.equal(ms.stream, true);
+  assert.ok(/Instrumental only/.test(ms.prompt));
+  const musicUrl = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp3/)[0];
+  assert.ok(r.content.some((c) => c.type === 'resource' && c.resource.text.includes('<audio')));
+  const mp = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name:format=duration', '-of', 'json', path.join(tmp, 'media', musicUrl.split('/').pop())]).toString());
+  assert.equal(mp.streams[0].codec_name, 'mp3');
+  assert.ok(Math.abs(Number(mp.format.duration) - 3) < 0.3, 'streamed WAV chunks reassembled and converted to mp3');
+  const mSpend = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-M'];
+  assert.ok(Math.abs(mSpend - 0.04 * 1.5) < 1e-9, 'music charged at real cost x markup: ' + mSpend);
+  r = await mC.callTool({ name: 'generate_music', arguments: { prompt: 'upbeat pop', length: 'song', lyrics: 'Salam, dünya' } });
+  assert.ok(!r.isError);
+  assert.equal(musicSeen.at(-1).model, 'google/lyria-3-pro-preview');
+  assert.ok(/Lyrics:\nSalam, dünya/.test(musicSeen.at(-1).prompt) && !/Instrumental/.test(musicSeen.at(-1).prompt));
+  r = await mC.callTool({ name: 'generate_music', arguments: { prompt: 'x y z' } });
+  assert.ok(r.isError && /Daily music limit/.test(r.content[0].text));
+  ok('generate_music: streamed audio -> mp3, clip/song models, lyrics, charged cost x markup, daily limit');
+
+  r = await mC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: wideUrl, seconds: 2 }], music_url: musicUrl } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  r = await mC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: wideUrl, seconds: 2 }], music_url: wideUrl } });
+  assert.ok(r.isError && /music_url must be an audio/.test(r.content[0].text));
+  ok('assemble_short uses a generated track as music_url; non-audio rejected');
+
+  r = await mC.callTool({ name: 'import_media', arguments: { url: wideUrl } });
+  assert.ok(!r.isError, JSON.stringify(r));
+  assert.ok(/Imported the user's image, 1600x900/.test(r.content[0].text) && r.content.some((c) => c.type === 'image'));
+  const impImg = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.jpg/)[0];
+  assert.notEqual(impImg, wideUrl);
+  r = await mC.callTool({ name: 'import_media', arguments: { url: voiceUrl } });
+  assert.ok(!r.isError && /audio, 5\.\d+s/.test(r.content[0].text), JSON.stringify(r));
+  r = await mC.callTool({ name: 'import_media', arguments: { url: shortUrl } });
+  assert.ok(!r.isError && /video, 1080x1920/.test(r.content[0].text), JSON.stringify(r));
+  const impVid = r.content[0].text.match(/http:\/\/\S+\/media\/[a-f0-9]{32}\.mp4/)[0];
+  r = await mC.callTool({ name: 'import_media', arguments: { url: `http://127.0.0.1:${MCP_PORT}/health` } });
+  assert.ok(r.isError && /not an image, audio or video/.test(r.content[0].text), JSON.stringify(r));
+  r = await mC.callTool({ name: 'import_media', arguments: { url: 'https://www.tiktok.com/@a/video/1' } });
+  assert.ok(r.isError && /cannot be downloaded/.test(r.content[0].text));
+  r = await mC.callTool({ name: 'assemble_short', arguments: { scenes: [{ media_url: impImg, seconds: 2 }, { media_url: impVid, seconds: 2 }] } });
+  assert.ok(!r.isError, 'imported files work in assemble_short');
+  ok('import_media: image re-encoded, audio -> mp3, video remuxed; usable in montages; non-media and TikTok links rejected');
+
 
   // ---- long video -> clips ----
   const srcName = 'b'.repeat(32) + '.mp4';
@@ -580,6 +633,23 @@ try {
   const s2 = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'state.json'), 'utf8')).media['user-S'];
   assert.equal(s2, s1, 'a rejected post is not charged');
   ok('a post rejected by Post for Me is reported with its reason and not charged');
+
+  r = await sC.callTool({ name: 'social_list_scheduled', arguments: {} });
+  assert.ok(!r.isError, JSON.stringify(r));
+  const pending = JSON.parse(r.content[0].text.split('\nTimes')[0]);
+  assert.ok(pending.length >= 1 && pending.every((p) => ['scheduled', 'draft'].includes(p.status)), r.content[0].text);
+  assert.ok(!JSON.stringify(pending).includes('SECRET'));
+  const lastSent = pfmSeen.filter((x) => x.method === 'POST' && x.path === '/social-posts').at(-1);
+  assert.equal(lastSent.body.external_id, 'lc_user-S', 'posts are tagged with the user');
+  const victim = pending[0].post_id;
+  const otherS = await connect({ 'x-api-key': 'sekret', 'x-user-id': 'user-B' });
+  r = await otherS.callTool({ name: 'social_cancel_post', arguments: { post_id: victim } });
+  assert.ok(r.isError && /Unknown post_id/.test(r.content[0].text), 'cannot cancel other users posts');
+  r = await sC.callTool({ name: 'social_cancel_post', arguments: { post_id: victim } });
+  assert.ok(!r.isError && /cancelled|deleted/.test(r.content[0].text), JSON.stringify(r));
+  r = await sC.callTool({ name: 'social_cancel_post', arguments: { post_id: 'sp_1' } });
+  assert.ok(r.isError && /only scheduled posts and drafts/.test(r.content[0].text), JSON.stringify(r));
+  ok('social_list_scheduled / social_cancel_post: own pending posts only; published posts cannot be cancelled');
 
   const anonC = await connect({ 'x-api-key': 'sekret' });
   r = await anonC.callTool({ name: 'social_list_accounts', arguments: {} });

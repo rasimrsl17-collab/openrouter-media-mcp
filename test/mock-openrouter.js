@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 // Local mock of the OpenRouter media endpoints, returning the response shapes
 // documented at openrouter.ai/docs. Used only for automated tests.
 import express from 'express';
@@ -115,6 +116,23 @@ app.post('/audio/transcriptions', (req, res) => {
   }
   res.json({ text: words.map((w) => w.word).join(' '), language: b.language || 'english', duration: 40, words, segments, usage: { cost: 0.001, seconds: 40 } });
 });
+// Lyria-style music: SSE stream of base64 WAV chunks split at non-4-aligned offsets, cost in the last chunk
+export const musicSeen = [];
+let musicWav = null;
+app.post('/chat/completions', (req, res) => {
+  const b = req.body;
+  musicSeen.push({ model: b.model, modalities: b.modalities, audio: b.audio, stream: b.stream, prompt: b.messages?.[0]?.content });
+  if (!musicWav) {
+    musicWav = execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=330:duration=3', '-ac', '2', '-ar', '48000', '-f', 'wav', 'pipe:1']);
+  }
+  const b64 = musicWav.toString('base64');
+  res.setHeader('Content-Type', 'text/event-stream');
+  for (let i = 0; i < b64.length; i += 999) {
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { audio: { data: b64.slice(i, i + 999), transcript: i ? '' : 'calm piano' } } }] })}\n\n`);
+  }
+  res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { cost: 0.04 } })}\n\n`);
+  res.end('data: [DONE]\n\n');
+});
 app.get('/models', (req, res) =>
   res.json({ data: [{ id: 'microsoft/mai-voice-2.1', name: 'MAI Voice 2.1', supported_voices: ['en-US-Harper:MAI-Voice-2.1'] }] }),
 );
@@ -186,6 +204,19 @@ pf.post('/social-posts', (req, res) => {
   }
   const { body, ...out } = post;
   res.status(201).json(out);
+});
+pf.get('/social-posts', (req, res) => {
+  const ext = arr(req.query.external_id);
+  const st = arr(req.query.status);
+  const data = pfm.posts.filter((p) => (!ext.length || ext.includes(p.body.external_id)) && (!st.length || st.includes(p.status)));
+  res.json({ data: data.map(({ body, ...o }) => o), meta: { total: data.length } });
+});
+pf.delete('/social-posts/:id', (req, res) => {
+  const i = pfm.posts.findIndex((x) => x.id === req.params.id);
+  if (i < 0) return res.status(404).json({ message: 'Post not found' });
+  if (!['scheduled', 'draft'].includes(pfm.posts[i].status)) return res.status(400).json({ message: 'Can only delete scheduled or draft posts' });
+  pfm.posts.splice(i, 1);
+  res.json({ success: true });
 });
 pf.get('/social-posts/:id', (req, res) => {
   const p = pfm.posts.find((x) => x.id === req.params.id);
