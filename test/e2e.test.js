@@ -315,7 +315,7 @@ try {
   const dur = Number(probe.format.duration);
   assert.ok(dur >= 5.5 && dur < 6.3, 'last scene stretched to cover the 5.5 s voiceover, got ' + dur);
   const stt = sttSeen.at(-1);
-  assert.equal(stt.model, 'openai/whisper-large-v3');
+  assert.equal(stt.model, 'openai/whisper-large-v3-turbo');
   assert.deepEqual(stt.granularities, ['word', 'segment']);
   assert.ok(stt.bytes > 1000 && stt.format === 'mp3');
   ok(`assemble_short -> 1080x1920 H.264+AAC, ${dur.toFixed(2)}s (scenes 4.5s, stretched to voiceover), word captions from STT`);

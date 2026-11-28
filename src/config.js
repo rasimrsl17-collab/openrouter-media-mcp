@@ -87,7 +87,7 @@ export const config = {
   ffprobePath: process.env.FFPROBE_PATH || 'ffprobe',
   captionFont: process.env.CAPTION_FONT || 'DejaVu Sans',
   // speech-to-text (word-timed captions + long-video transcripts); ~$0.11 per audio hour on OpenRouter
-  sttModel: process.env.STT_MODEL || 'openai/whisper-large-v3',
+  sttModel: process.env.STT_MODEL || 'openai/whisper-large-v3-turbo',
   // royalty-free background tracks you own the rights to (*.mp3 / *.m4a); file name = track name
   musicDir: process.env.MUSIC_DIR || '/data/music',
 
